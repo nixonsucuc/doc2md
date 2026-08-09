@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "doc2md"
+version = "0.1.0"
+description = "Document-to-Markdown conversion tool"
+dependencies = [
+    # Only the extras this tool converts. NOT markitdown[all] — that pulls
+    # pandas, speechrecognition and the Azure SDKs for paths doc2md never uses.
+    "markitdown[docx,pptx,pdf,outlook]",
+    # Layout-aware PDF extraction; markitdown[pdf] stays as the fallback.
+    "pdf-inspector",
+    "pymupdf",
+    "pytesseract",
+    "Pillow",
+    "google-genai",
+    "langdetect"
+]
+
+[project.scripts]
+doc2md = "doc2md:main"

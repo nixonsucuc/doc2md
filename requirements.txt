@@ -1,0 +1,12 @@
+# Only the markitdown extras this tool actually converts.
+# Deliberately NOT markitdown[all]: that pulls pandas, speechrecognition and the
+# Azure SDKs for spreadsheet, audio and cloud paths doc2md never uses.
+markitdown[docx,pptx,pdf,outlook]
+# Layout-aware PDF text extraction. The markitdown[pdf] extra above is kept as
+# the fallback for when this native wheel is unavailable or fails on a file.
+pdf-inspector
+pymupdf
+pytesseract
+Pillow
+google-genai
+langdetect

@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Built droplet — regenerate with ./droplet/build.sh
+*.app/
+
+# Never commit credentials. The real key lives in ~/.config/doc2md/env, outside
+# this tree; this line is belt-and-braces in case one is ever dropped in here.
+env
+.env
+*.key
+usage.json
+
+# Claude Code per-machine local settings
+.claude/settings.local.json
