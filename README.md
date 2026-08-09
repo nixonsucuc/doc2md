@@ -120,6 +120,31 @@ Against Google AI Studio's free 250k/day that is ~93 images. Three guards:
 Every run prints what it is about to spend before spending it, and what it spent
 afterwards.
 
+## What we take from pdf-inspector
+
+PDFs are routed through `pdf-inspector`, which is layout-aware and reports
+per-page state. Specifically:
+
+- `classify_pdf()` as a pre-flight — 1–6 ms, because it samples content streams
+  rather than extracting. Reports the document type, page count, confidence, and
+  which pages will need OCR before any of the expensive work starts.
+- `extract_pages_markdown()` for the text, per page, with its `needs_ocr` flag
+  and the *reason* behind it. A page flagged `suspected_garbled_text` has a text
+  layer that is broken rather than absent — a different problem, so it is
+  reported differently and raises a warning naming the pages.
+- Table and multi-column detection, currently surfaced in the log.
+
+Two things come from PyMuPDF instead, which is already a dependency:
+
+- **The document's own title**, used as the H1 when the text supplies no heading
+  of its own. Titles that are really filenames (`draft.docx`) or authoring-tool
+  defaults are rejected — a wrong title is worse than none, since it is the first
+  line the model reads.
+- **Hyperlinks**, which live in link *annotations* and are therefore invisible to
+  every text extractor. A page reading "schedule a free consultation" otherwise
+  loses the address entirely. The text under the link rectangle becomes the
+  anchor when it reads as language, and a bare URL when it does not.
+
 ## Diagram pages
 
 A page drawn in vectors — an infographic, a roadmap — has a real text layer, so

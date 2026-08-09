@@ -46,6 +46,13 @@ scrolling. The steps, in order:
    text/no-text state) with `MarkItDown` as the fallback, everything else goes
    straight to `MarkItDown`. A missing/failing native wheel degrades to
    MarkItDown rather than breaking the run.
+   PDFs also get a `classify_pdf()` pre-flight (1–6 ms, no extraction) logged
+   before the work starts, and two things PyMuPDF supplies that pdf-inspector
+   cannot: `read_pdf_title()` for the document's declared title (used as the H1
+   only when the text has no heading of its own), and `read_pdf_links()` for
+   hyperlinks, which live in annotations and are invisible to text extraction.
+   `PdfPageInfo.ocr_reason` distinguishes "no text layer" from
+   "suspected_garbled_text" — a broken encoding, not an absent one.
 2. **Extract embedded images** (`extract_images` + format-specific
    `extract_images_pdf/_zip/_eml`) — plus, for PDFs, `render_pdf_pages`
    rasterizes only the pages `pdf-inspector` flagged as having no text layer

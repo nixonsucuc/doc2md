@@ -69,6 +69,15 @@ VISION_MODEL = "gemini-3.6-flash"  # ← Change this one line to upgrade
 # is given. A single shared folder, not one beside each input document.
 DEFAULT_OUTPUT_DIR = Path.home() / "Downloads" / "doc2md"
 
+# pdf-inspector's OCR reasons, in plain language. "no text layer" and "the text
+# is there but broken" send you looking for very different problems.
+OCR_REASON_TEXT = {
+    "no_text_layer": "no extractable text",
+    "suspected_garbled_text": "broken font encoding",
+    "image_based": "page is an image",
+    "scanned": "scanned page",
+}
+
 # Records which document an output folder belongs to, so that two files sharing a
 # stem (report.pdf, report.docx) do not overwrite each other while re-converting
 # the same file still overwrites in place. See claim_output_folder().
@@ -274,6 +283,13 @@ class PdfPageInfo:
     number: int          # 0-indexed, normalised on ingest
     markdown: str = ""
     needs_ocr: bool = False
+    # Why pdf-inspector wants OCR: "no_text_layer", "suspected_garbled_text", …
+    # A garbled page *has* text, so reporting it as empty would mislead.
+    ocr_reason: str = ""
+    # Kept apart from `markdown` as well as merged into it: a diagram page's text
+    # is replaced wholesale by its vision description, and the links must survive
+    # that — an address is content the description cannot reconstruct.
+    links: list = field(default_factory=list)
 
 
 @dataclass
@@ -288,6 +304,7 @@ class DocumentSource:
     pages: list[PdfPageInfo] = field(default_factory=list)
     pdf_type: str | None = None
     page_count: int = 0
+    title: str = ""        # the document's own title, when it declares one
 
 
 @dataclass
@@ -301,6 +318,7 @@ class ProcessingReport:
     images_ai: int = 0
     images_photo: int = 0
     warnings: list[str] = field(default_factory=list)
+    title: str = ""               # The document's own declared title, if any
     vision_tokens: int = 0        # Actual tokens spent, thinking included
     vision_held: int = 0          # Deferred pending confirmation, not lost
     start_time: float = 0.0
@@ -1215,6 +1233,14 @@ def assemble_by_page(
             sections.append(page.markdown.strip())
         for img in page_images:
             sections.append(build_image_reference(img, images_dir_name))
+        # Links survive a supersede. The description replaces the scrambled text,
+        # but it cannot invent a URL that was only ever a link annotation.
+        if superseded and page.links:
+            sections.append(
+                "**Links:**\n" + "\n".join(
+                    f"- [{a}]({u})" if a else f"- <{u}>" for a, u in page.links
+                )
+            )
 
     return "\n\n".join(sections)
 
@@ -1328,6 +1354,120 @@ def normalize_pdf_tables(markdown: str) -> str:
     return "\n".join(out)
 
 
+# ── PDF Metadata ──────────────────────────────────────────────────────────────
+def read_pdf_title(input_path: Path) -> str:
+    """
+    The title the PDF declares for itself, if it is worth using.
+
+    Read through PyMuPDF, which is already a dependency, rather than
+    pdf-inspector's process_pdf() — that returns flat Markdown instead of the
+    per-page structure the pipeline needs, so using it would mean parsing twice.
+
+    Plenty of PDFs carry a useless title: the authoring tool's default, or the
+    original filename with an extension still attached. Those are rejected here,
+    because a wrong title is worse than none — it is the first line the model
+    reads.
+    """
+    try:
+        with fitz.open(str(input_path)) as doc:
+            title = ((doc.metadata or {}).get("title") or "").strip()
+    except Exception:
+        return ""
+
+    if len(title) < 3 or len(title) > 200:
+        return ""
+    lowered = title.lower()
+    if lowered.endswith((".pdf", ".doc", ".docx", ".indd", ".ai", ".qxd")):
+        return ""
+    # Authoring-tool defaults, and titles that are just a bare number.
+    if lowered in {"untitled", "document", "microsoft word document", "pdf document"}:
+        return ""
+    if re.fullmatch(r"[\d\s.\-_]+", title):
+        return ""
+    return title
+
+
+def read_pdf_links(input_path: Path) -> dict[int, list[tuple[str, str]]]:
+    """
+    Harvest hyperlink annotations, keyed by 0-based page.
+
+    A URL that lives in a link annotation rather than in the text is invisible to
+    every text extractor, pdf-inspector included — its "URL linking" covers URLs
+    written out in the text. So a page reading "schedule a free consultation"
+    loses the address entirely, which for a tool whose output is model context is
+    a real loss rather than a cosmetic one.
+
+    The text under the link rectangle becomes the anchor, so the result can be a
+    proper Markdown link instead of a bare URL with no indication of what it was
+    attached to.
+    """
+    links: dict[int, list[tuple[str, str]]] = {}
+    try:
+        with fitz.open(str(input_path)) as doc:
+            for index, page in enumerate(doc):
+                seen: set[str] = set()
+                for link in page.get_links():
+                    uri = (link.get("uri") or "").strip()
+                    if not uri or uri in seen:
+                        continue
+                    seen.add(uri)
+                    anchor = ""
+                    try:
+                        rect = link.get("from")
+                        if rect is not None:
+                            anchor = usable_anchor(
+                                " ".join(page.get_text("text", clip=rect).split())
+                            )
+                    except Exception:
+                        anchor = ""
+                    links.setdefault(index, []).append((anchor, uri))
+    except Exception:
+        return {}
+    return links
+
+
+def usable_anchor(text: str) -> str:
+    """
+    Keep link anchor text only when it reads as language.
+
+    The text under a link rectangle comes from the same layer as everything else,
+    so on a page whose text is scrambled the anchor is scrambled too — one sample
+    yielded "Every organizat q Schedule a free consultation d oach to disc".
+    Stray single letters are the giveaway, since real prose has almost none
+    beyond "a" and "I". A bare URL beats a corrupted label.
+    """
+    text = text.strip()
+    if not text or len(text) > 80:
+        return ""
+    tokens = text.split()
+    stray = sum(1 for t in tokens if len(t) == 1 and t.lower() not in {"a", "i"})
+    return "" if stray >= 2 else text
+
+
+def merge_links_into_page(markdown: str, links: list[tuple[str, str]]) -> str:
+    """
+    Attach a page's links to its Markdown.
+
+    Preferred form is an inline Markdown link, but only when the anchor text
+    appears exactly once on the page — substituting into ambiguous text would
+    silently corrupt it. Everything else is appended as a short list, which keeps
+    the address rather than guessing where it belonged.
+    """
+    if not links:
+        return markdown
+
+    leftovers = []
+    for anchor, uri in links:
+        if anchor and markdown.count(anchor) == 1 and f"]({uri})" not in markdown:
+            markdown = markdown.replace(anchor, f"[{anchor}]({uri})", 1)
+        else:
+            leftovers.append(f"- [{anchor}]({uri})" if anchor else f"- <{uri}>")
+
+    if leftovers:
+        markdown = markdown.rstrip() + "\n\n**Links:**\n" + "\n".join(leftovers)
+    return markdown
+
+
 # ── Document Routing ──────────────────────────────────────────────────────────
 def _pdf_via_inspector(input_path: Path, report: ProcessingReport) -> DocumentSource:
     """
@@ -1337,13 +1477,33 @@ def _pdf_via_inspector(input_path: Path, report: ProcessingReport) -> DocumentSo
     0-based while the summary lists are 1-based — so page numbers are normalised
     to 0-based here, matching ImageInfo.source_page, and nowhere else.
     """
+    # Pre-flight. Costs 1–6 ms because it samples content streams rather than
+    # extracting, and it says up front what kind of document this is and how much
+    # of it will need OCR — which is the expensive part.
+    try:
+        summary = pdf_inspector.classify_pdf(str(input_path))
+        logger.info(
+            "  %s PDF, %d page(s), confidence %.2f%s"
+            % (summary.pdf_type, summary.page_count, summary.confidence,
+               f", {len(summary.pages_needing_ocr)} needing OCR"
+               if summary.pages_needing_ocr else "")
+        )
+    except Exception:
+        pass  # advisory only; extraction below is what actually matters
+
     result = pdf_inspector.extract_pages_markdown(str(input_path))
+    links = read_pdf_links(input_path)
 
     pages = [
         PdfPageInfo(
             number=page.page,
-            markdown=normalize_pdf_tables(page.markdown or ""),
+            markdown=merge_links_into_page(
+                normalize_pdf_tables(page.markdown or ""),
+                links.get(page.page, []),
+            ),
             needs_ocr=bool(page.needs_ocr),
+            ocr_reason=(getattr(page, "ocr_reason", "") or ""),
+            links=links.get(page.page, []),
         )
         for page in result.pages
     ]
@@ -1353,14 +1513,32 @@ def _pdf_via_inspector(input_path: Path, report: ProcessingReport) -> DocumentSo
     if getattr(result, "pages_with_columns", None):
         logger.info(f"  Multi-column layout on page(s): {result.pages_with_columns}")
 
-    needing_ocr = [p.number + 1 for p in pages if p.needs_ocr]
-    if needing_ocr:
-        logger.info(f"  Page(s) with no extractable text, will be OCR'd: {needing_ocr}")
+    found_links = sum(len(v) for v in links.values())
+    if found_links:
+        logger.info(f"  {found_links} hyperlink(s) recovered from link annotations")
+
+    # Group by reason rather than lumping every page under "no extractable text":
+    # a page flagged suspected_garbled_text *has* a text layer, it is just broken,
+    # and saying otherwise sends you looking for the wrong problem.
+    by_reason: dict[str, list[int]] = {}
+    for page in pages:
+        if page.needs_ocr:
+            by_reason.setdefault(page.ocr_reason or "no_text_layer", []).append(
+                page.number + 1
+            )
+    for reason, numbers in by_reason.items():
+        logger.info(f"  Page(s) to OCR — {OCR_REASON_TEXT.get(reason, reason)}: {numbers}")
+        if reason == "suspected_garbled_text":
+            report.warnings.append(
+                f"Broken font encoding on page(s) {numbers}; "
+                "text was unreadable so the page was OCR'd instead."
+            )
 
     return DocumentSource(
         markdown="\n\n".join(p.markdown for p in pages if p.markdown.strip()),
         pages=pages,
         page_count=len(pages),
+        title=read_pdf_title(input_path),
     )
 
 
@@ -1730,6 +1908,8 @@ def convert_document(
 
     # ── Step 6: Assemble final Markdown ──────────────────────────────────
     logger.info("Step 6/6: Assembling final Markdown...")
+    if source.title:
+        report.title = source.title
     if source.pages:
         # Per-page Markdown lets images sit with the text they belong to.
         final_markdown = assemble_by_page(source.pages, images, images_dir_name)
@@ -1748,6 +1928,13 @@ def convert_document(
         )
 
     # Write output
+    # A document that declares a title but whose text opens with no heading gets
+    # one, so the first thing a model reads says what it is looking at. When the
+    # text already leads with a heading, that heading is the better one — it came
+    # from the page, not from metadata that may be a stale authoring artefact.
+    if source.title and not re.match(r"\s*#\s", final_markdown):
+        final_markdown = f"# {source.title}\n\n{final_markdown}"
+
     output_path.write_text(final_markdown, encoding="utf-8")
     logger.info(f"  Saved: {output_path}")
 

@@ -239,6 +239,84 @@ class TestSettings(unittest.TestCase):
             )
 
 
+class TestPdfMetadata(unittest.TestCase):
+    """Title and hyperlink recovery, both read through PyMuPDF."""
+
+    def make_pdf(self, title=None, link=None, text="Hello there, this is a page."):
+        import fitz
+        path = Path(tempfile.mkdtemp()) / "sample.pdf"
+        self.addCleanup(shutil.rmtree, path.parent, ignore_errors=True)
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((72, 100), text, fontsize=12)
+        if title is not None:
+            doc.set_metadata({"title": title})
+        if link is not None:
+            page.insert_link({"kind": fitz.LINK_URI, "uri": link,
+                              "from": fitz.Rect(70, 88, 300, 106)})
+        doc.save(path)
+        doc.close()
+        return path
+
+    def test_declared_title_is_used(self):
+        self.assertEqual(doc2md.read_pdf_title(self.make_pdf(title="Annual Report 2026")),
+                         "Annual Report 2026")
+
+    def test_filename_shaped_titles_are_rejected(self):
+        """Authoring tools leave the source filename in the title field."""
+        for junk in ("draft.docx", "final.pdf", "Untitled", "document", "  ", "2024"):
+            self.assertEqual(doc2md.read_pdf_title(self.make_pdf(title=junk)), "", junk)
+
+    def test_missing_title_is_empty_not_an_error(self):
+        self.assertEqual(doc2md.read_pdf_title(self.make_pdf()), "")
+
+    def test_unreadable_file_does_not_raise(self):
+        bad = Path(tempfile.mkdtemp()) / "broken.pdf"
+        self.addCleanup(shutil.rmtree, bad.parent, ignore_errors=True)
+        bad.write_bytes(b"not a pdf at all")
+        self.assertEqual(doc2md.read_pdf_title(bad), "")
+        self.assertEqual(doc2md.read_pdf_links(bad), {})
+
+    def test_link_annotation_is_recovered(self):
+        """A URL in an annotation is invisible to every text extractor."""
+        links = doc2md.read_pdf_links(self.make_pdf(link="https://example.com/x"))
+        self.assertEqual([uri for _, uri in links[0]], ["https://example.com/x"])
+
+
+class TestLinkMerging(unittest.TestCase):
+    def test_unique_anchor_becomes_an_inline_link(self):
+        out = doc2md.merge_links_into_page("See the guide for details.",
+                                           [("the guide", "https://example.com")])
+        self.assertIn("[the guide](https://example.com)", out)
+        self.assertNotIn("**Links:**", out)
+
+    def test_ambiguous_anchor_is_listed_instead_of_substituted(self):
+        """Two matches means no way to know which one the link belonged to."""
+        out = doc2md.merge_links_into_page("guide and guide again",
+                                           [("guide", "https://example.com")])
+        self.assertIn("**Links:**", out)
+        self.assertEqual(out.count("](https://example.com)"), 1)
+
+    def test_missing_anchor_falls_back_to_a_bare_url(self):
+        out = doc2md.merge_links_into_page("Body text.", [("", "https://example.com")])
+        self.assertIn("<https://example.com>", out)
+
+    def test_no_links_leaves_markdown_untouched(self):
+        self.assertEqual(doc2md.merge_links_into_page("Body.", []), "Body.")
+
+    def test_garbled_anchor_is_rejected(self):
+        """Scrambled pages yield scrambled anchors; a bare URL beats a bad label."""
+        self.assertEqual(
+            doc2md.usable_anchor("Every organizat q Schedule a free consultation d oach"), "")
+
+    def test_ordinary_anchor_survives(self):
+        self.assertEqual(doc2md.usable_anchor("Schedule a free consultation"),
+                         "Schedule a free consultation")
+
+    def test_absurdly_long_anchor_is_rejected(self):
+        self.assertEqual(doc2md.usable_anchor("word " * 40), "")
+
+
 class TestVisionBudget(unittest.TestCase):
     """Guards on what a single drag is allowed to spend."""
 
