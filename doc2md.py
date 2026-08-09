@@ -131,6 +131,26 @@ VISION_WARN_THRESHOLD = 20
 
 USAGE_FILE = Path.home() / ".config" / "doc2md" / "usage.json"
 
+# Settings live beside the usage counter, but separate from the API key in
+# `env`: secrets and preferences have different handling, and keeping them apart
+# means the settings file can be read, edited and shared without leaking one.
+CONFIG_FILE = Path.home() / ".config" / "doc2md" / "config.json"
+
+# Only these are user-settable. The classification thresholds are deliberately
+# absent: they were calibrated against a sample corpus (see MIGRATION.md) and
+# exposing them in a settings window would invite silently breaking the
+# classifier with no way to tell that it had happened.
+#
+#   setting name -> (module constant, parser, validator)
+CONFIGURABLE: dict = {
+    "output_dir": ("DEFAULT_OUTPUT_DIR", lambda v: Path(v).expanduser(), None),
+    "vision_model": ("VISION_MODEL", str, lambda v: bool(v.strip())),
+    "vision_hard_cap": ("VISION_HARD_CAP", int, lambda v: 1 <= v <= 500),
+    "vision_warn_threshold": ("VISION_WARN_THRESHOLD", int, lambda v: 0 <= v <= 500),
+    "vision_daily_budget": ("VISION_DAILY_BUDGET", int, lambda v: v > 0),
+    "ocr_languages": ("OCR_DEFAULT_LANGS", str, lambda v: bool(v.strip())),
+}
+
 # ── Page-level diagram detection ──────────────────────────────────────────────
 # An infographic drawn in vectors has a real text layer, so it is never
 # rasterized for OCR, and holds no embedded image, so nothing reaches the
@@ -853,6 +873,66 @@ def should_escalate_to_vision(img: ImageInfo) -> bool:
         # escalating on no evidence would send private photos to the API.
         return False  # Too little structure to be a diagram worth describing
     return not ocr_looks_like_prose(img.ocr_text)
+
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+def load_config(path: Path | None = None) -> dict:
+    """
+    Read the settings file, keeping only keys that are known and values that are
+    sane.
+
+    A settings file is edited by a GUI, by hand, and by future versions of this
+    tool, so it is treated as untrusted input: anything unparseable is dropped
+    and the built-in default stands. A corrupt config must never stop a
+    conversion — the worst it should cost is a preference.
+    """
+    source = CONFIG_FILE if path is None else path
+    try:
+        raw = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    clean: dict = {}
+    for key, (_, parse, valid) in CONFIGURABLE.items():
+        if key not in raw or raw[key] is None:
+            continue
+        try:
+            value = parse(raw[key])
+        except (TypeError, ValueError):
+            continue
+        if valid is not None and not valid(value):
+            continue
+        clean[key] = value
+
+    # A confirmation threshold above the hard cap can never fire, which would
+    # silently disable the confirmation step. Treat that as "always confirm".
+    cap = clean.get("vision_hard_cap", VISION_HARD_CAP)
+    if clean.get("vision_warn_threshold", VISION_WARN_THRESHOLD) > cap:
+        clean["vision_warn_threshold"] = cap
+
+    return clean
+
+
+def apply_config(path: Path | None = None) -> list[str]:
+    """
+    Override the module defaults from the settings file.
+
+    Rebinding module globals rather than threading a config object through every
+    function is deliberate: these values are read from a dozen places in one
+    single-process run, and the alternative is a parameter on almost every
+    signature for a value that never changes mid-run.
+
+    Returns a description of what changed, for the log.
+    """
+    applied = []
+    for key, value in load_config(path).items():
+        constant = CONFIGURABLE[key][0]
+        if globals().get(constant) != value:
+            globals()[constant] = value
+            applied.append(f"{key}={value}")
+    return applied
 
 
 # ── Vision Budget ────────────────────────────────────────────────────────────
@@ -1689,6 +1769,10 @@ def convert_document(
 
 # ── CLI Entry Point ───────────────────────────────────────────────────────────
 def main():
+    # Before the parser is built: several --help strings and defaults quote these
+    # values, so the settings file has to be in effect by then.
+    config_notes = apply_config()
+
     parser = argparse.ArgumentParser(
         description="Convert documents to clean, LLM-friendly Markdown.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1724,6 +1808,9 @@ def main():
     # Silence third-party noisy loggers
     for noisy_logger in ["pdfminer", "fitz", "PIL", "urllib3", "google", "httpx", "httpcore"]:
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
+    if config_notes:
+        logger.debug(f"Settings from {CONFIG_FILE}: {', '.join(config_notes)}")
 
     # Validate input
     input_path = Path(args.input_file).resolve()

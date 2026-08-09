@@ -6,6 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "doc2md"
 version = "0.1.0"
 description = "Document-to-Markdown conversion tool"
+license = "MIT"
+requires-python = ">=3.10"
 dependencies = [
     # Only the extras this tool converts. NOT markitdown[all] — that pulls
     # pandas, speechrecognition and the Azure SDKs for paths doc2md never uses.

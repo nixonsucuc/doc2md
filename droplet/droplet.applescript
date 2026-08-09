@@ -7,16 +7,26 @@
 -- once per file so the progress bar can move between them.
 
 on run
-	-- Opened with no files. Show where output goes rather than doing nothing.
-	set outFolder to (path to downloads folder as text) & "doc2md"
+	-- Opened with no files, which is what a double-click means. Settings is the
+	-- useful thing to show; the output folder is one click away from there and is
+	-- named in every completion notification anyway.
+	set settingsApp to (path to home folder as text) & "Applications:doc2md Settings.app"
+	try
+		tell application "Finder" to get settingsApp as alias
+		do shell script "open -a " & quoted form of (POSIX path of settingsApp)
+		return
+	end try
+
+	-- Settings not built. Fall back to the output folder.
 	try
 		tell application "Finder"
-			open folder outFolder
+			open folder ((path to downloads folder as text) & "doc2md")
 			activate
 		end tell
 	on error
 		display dialog "Nothing converted yet." & return & return & ¬
-			"Drag a document onto this app's icon to convert it to Markdown." ¬
+			"Drag a document onto this app's icon to convert it to Markdown." & return & ¬
+			"Build the settings window with ./settings/build.sh." ¬
 			buttons {"OK"} default button 1 with title "doc2md" with icon note
 	end try
 end run

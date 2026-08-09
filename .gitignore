@@ -10,7 +10,7 @@ venv/
 # macOS
 .DS_Store
 
-# Built droplet — regenerate with ./droplet/build.sh
+# Built apps — regenerate with ./droplet/build.sh and ./settings/build.sh
 *.app/
 
 # Never commit credentials. The real key lives in ~/.config/doc2md/env, outside

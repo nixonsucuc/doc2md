@@ -41,19 +41,45 @@ Output lands in `~/Downloads/doc2md/report/` as `report.md`, plus `images/` and
 
 ## Drag and drop
 
-Build a droplet and drag documents onto it. Output goes to `~/Downloads/doc2md`
-exactly as it does from the command line.
-
 ```bash
-./droplet/build.sh
+./droplet/build.sh     # ~/Applications/doc2md.app  — drag documents onto it
+./settings/build.sh    # ~/Applications/doc2md Settings.app
 ```
 
-That installs `~/Applications/doc2md.app` — put it in the Dock or the Finder
-toolbar. Details in [droplet/README.md](droplet/README.md).
+Put the droplet in the Dock, or ⌘-drag it onto the Finder toolbar where it
+becomes a drop target on every window. Output goes to `~/Downloads/doc2md`
+exactly as it does from the command line. Double-clicking it opens Settings.
 
-There is also a [Dropzone 4 action](dropzone/README.md) in `dropzone/`, for the
-Dropzone grid. Note that custom actions are a **Dropzone Pro** feature; without
-Pro it will not install, and the droplet above is the free equivalent.
+Both are built from tools that ship with macOS — `osacompile`, `swiftc`, `sips`
+— so there is nothing to install and nothing to buy. See
+[droplet/README.md](droplet/README.md) and [settings/README.md](settings/README.md).
+
+### Dropzone
+
+[`dropzone/`](dropzone/README.md) holds a full Dropzone 4 action, kept working
+and tested. It is the nicest of the front-ends to use if you already live in
+Dropzone — one grid slot, modifier keys for local-only and reveal-in-Finder —
+but custom actions are a **Dropzone Pro** feature, so it needs a Pro licence to
+install. The droplet is the free equivalent and loses nothing but the grid.
+
+## Settings
+
+`./settings/build.sh` builds a small window over the two files doc2md reads:
+
+| File | Holds |
+|---|---|
+| `~/.config/doc2md/config.json` | output folder, model, caps, daily budget, OCR languages |
+| `~/.config/doc2md/env` | `GEMINI_API_KEY`, kept apart from preferences and `chmod 600` |
+| `~/.config/doc2md/usage.json` | today's token spend, reset at midnight |
+
+Editing those files by hand and using the window are the same operation — the
+window owns no state of its own. Precedence is **CLI flag > config file >
+built-in default**, and a corrupt config costs you a preference, never a
+conversion.
+
+The classification thresholds are deliberately *not* configurable. They were
+calibrated against a sample corpus (see [MIGRATION.md](MIGRATION.md)) and a
+slider that silently degrades classification is worse than no slider.
 
 ## Formats
 
@@ -102,6 +128,38 @@ classifier. Its text used to come out in coordinate order, scrambled across the
 page. Such pages are now detected (many vector drawings, no embedded images,
 very short average line length), rendered, and sent to vision; a successful
 description replaces the scrambled text rather than sitting beside it.
+
+## Contributing
+
+Issues and pull requests welcome. The tool is one module, `doc2md.py`, organised
+as a six-step pipeline with `# ── Name ──` banner comments — navigate by those
+rather than scrolling.
+
+```bash
+pip3 install -e .
+python3 -m unittest discover -s tests -t .   # stdlib unittest, no pytest
+```
+
+Tests never make a network call: Gemini is always mocked, and tests needing the
+`tesseract` binary skip themselves when it is absent. Please keep it that way.
+
+Good places to start, roughly in order of how much someone would thank you:
+
+- **A status bar drop target.** The one front-end deliberately not built here. A
+  `NSStatusItem` that accepts dropped files would give the Dropzone experience
+  with no Pro licence. Two known snags: notifications from an unsigned bundle may
+  not register, and a 22px menu bar icon is a small drop target, which is exactly
+  why Dropzone uses a fly-out grid.
+- **The Dropzone action**, in `dropzone/`. Working but dormant for want of a Pro
+  licence, so it gets less real-world use than the droplet and is the most likely
+  place for bit-rot. Anyone with Pro who runs it is doing the project a favour.
+- **Linux and Windows.** Nothing in `doc2md.py` is macOS-specific, but every
+  front-end is, and paths like `/opt/homebrew/bin` are assumed in the GUI
+  wrappers.
+- **Classifier calibration.** The thresholds come from a small corpus of mostly
+  English and Spanish documents. Handwriting, dense scientific figures and
+  non-Latin scripts are unexplored. Measurements beat opinions here — see
+  MIGRATION.md for how the current numbers were arrived at.
 
 ## Notes
 

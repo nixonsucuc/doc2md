@@ -10,6 +10,7 @@ Gemini is always mocked — no test makes a network call. Tests that need the
 tesseract binary skip themselves when it is absent.
 """
 
+import json
 import logging
 import shutil
 import sys
@@ -155,6 +156,87 @@ class TestFolderClaiming(unittest.TestCase):
         """--output points somewhere the user chose; doc2md does not claim it."""
         p = doc2md.resolve_output_paths(Path("/docs/n.docx"), Path("/tmp/mine"))
         self.assertIsNone(p.source_marker)
+
+
+class TestSettings(unittest.TestCase):
+    """A settings file is edited by a GUI and by hand, so it is untrusted input."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.path = self.dir / "config.json"
+        # apply_config rebinds module globals, and one setting can pull another
+        # with it (a lowered hard cap clamps the warn threshold). Restore every
+        # configurable constant, not just the one a given test set.
+        saved = {c: getattr(doc2md, c) for c, _, _ in doc2md.CONFIGURABLE.values()}
+        self.addCleanup(lambda: [setattr(doc2md, c, v) for c, v in saved.items()])
+
+    def write(self, payload):
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+        return self.path
+
+    def test_missing_file_yields_no_overrides(self):
+        self.assertEqual(doc2md.load_config(self.dir / "absent.json"), {})
+
+    def test_corrupt_file_is_ignored_rather_than_fatal(self):
+        """A broken preference must never cost you a conversion."""
+        self.path.write_text("{{{ not json", encoding="utf-8")
+        self.assertEqual(doc2md.load_config(self.path), {})
+
+    def test_non_object_json_is_ignored(self):
+        self.path.write_text("[1, 2, 3]", encoding="utf-8")
+        self.assertEqual(doc2md.load_config(self.path), {})
+
+    def test_known_keys_are_parsed(self):
+        cfg = doc2md.load_config(self.write({
+            "vision_hard_cap": 30,
+            "ocr_languages": "eng+deu",
+            "output_dir": "~/Documents/md",
+        }))
+        self.assertEqual(cfg["vision_hard_cap"], 30)
+        self.assertEqual(cfg["ocr_languages"], "eng+deu")
+        self.assertEqual(cfg["output_dir"], Path.home() / "Documents" / "md")
+
+    def test_unknown_keys_are_dropped(self):
+        self.assertEqual(doc2md.load_config(self.write({"nonsense": 1})), {})
+
+    def test_wrong_type_falls_back_to_the_default(self):
+        self.assertNotIn("vision_hard_cap",
+                         doc2md.load_config(self.write({"vision_hard_cap": "lots"})))
+
+    def test_out_of_range_values_are_rejected(self):
+        for bad in (0, -5, 100_000):
+            self.assertNotIn("vision_hard_cap",
+                             doc2md.load_config(self.write({"vision_hard_cap": bad})), bad)
+
+    def test_threshold_above_cap_is_clamped_to_the_cap(self):
+        """Otherwise the confirmation step could never fire, disabling it silently."""
+        cfg = doc2md.load_config(self.write({
+            "vision_hard_cap": 10, "vision_warn_threshold": 40,
+        }))
+        self.assertEqual(cfg["vision_warn_threshold"], 10)
+
+    def test_apply_config_rebinds_and_reports(self):
+        notes = doc2md.apply_config(self.write({"vision_hard_cap": 7}))
+        self.assertEqual(doc2md.VISION_HARD_CAP, 7)
+        self.assertIn("vision_hard_cap=7", notes)
+
+    def test_lowering_the_cap_also_pulls_the_threshold_down(self):
+        """A side effect worth pinning: the threshold cannot outrun the cap."""
+        doc2md.apply_config(self.write({"vision_hard_cap": 7}))
+        self.assertEqual(doc2md.VISION_WARN_THRESHOLD, 7)
+
+    def test_apply_config_reports_nothing_when_file_matches_defaults(self):
+        notes = doc2md.apply_config(self.write({"vision_hard_cap": doc2md.VISION_HARD_CAP}))
+        self.assertEqual(notes, [])
+
+    def test_classifier_thresholds_are_not_user_settable(self):
+        """Calibrated against a corpus; a settings window must not reach them."""
+        for guarded in ("MAX_COLORS_DIAGRAM", "EDGE_DENSITY_THRESHOLD",
+                        "PAGE_DIAGRAM_MIN_DRAWINGS", "PHOTO_STDDEV_THRESHOLD"):
+            self.assertNotIn(
+                guarded, {c for c, _, _ in doc2md.CONFIGURABLE.values()}, guarded
+            )
 
 
 class TestVisionBudget(unittest.TestCase):
