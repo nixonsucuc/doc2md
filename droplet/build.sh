@@ -9,7 +9,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="${1:-$HOME/Applications}"
 APP="$DEST/doc2md.app"
-ICON_SRC="$HERE/../dropzone/Convert to Markdown.dzbundle/icon.png"
+ICON_SRC="$HERE/../assets/icon.png"
 
 ok() { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 
