@@ -349,3 +349,70 @@ standalone images and small embedded images.
   callers** passing `verbose=`; the `--verbose` CLI flag is unaffected.
 - Removed a duplicated empty-images-directory cleanup and a `report_path` that
   was computed during path resolution and then immediately recomputed.
+
+## 11. Heading inference for OCR'd pages — investigated, rejected
+
+Font-size heading inference kept coming up as an obvious win. It is not, and
+this records why so nobody repeats the experiment.
+
+**It is already done where it can be done.** pdf-inspector infers H1–H4 from font
+size ratios, and does it well. Given a synthetic page with 28/20/15/12 pt text
+over 11 pt body, it produced `#`, `##`, `###` correctly *and* declined to promote
+the 12 pt line — the marginal case a naive ratio threshold gets wrong. There is
+nothing to add on the PDF text-layer path.
+
+**The gap is scanned pages**, which come out of OCR completely flat. A real
+sample — a scanned dance manual page — has an obvious visual hierarchy: a large
+bold title, a centred sub-heading, column headers. All of it arrives as
+undifferentiated lines.
+
+### Why bounding-box height does not work
+
+Apple Vision returns a bounding box per observation, so height looks like a
+free font-size proxy. It is not. On the sample page, the largest heading —
+`CHOREOGRAPHED FLOOR PROGRESSION` — ranked **23rd of 72 lines** by box height,
+and the `Jackknife Contraction` sub-heading fell *below* the page median.
+
+The box measures glyph extent, not type size. An all-caps heading has no
+descenders and yields a short box; a body line containing parentheses and
+`y`/`g`/`p` yields a tall one. The signal is close to inverted.
+
+### Why width-per-character does not work either
+
+Width divided by character count is a much better proxy — it put that same
+heading at **rank 1 of 72**. With a baseline taken from prose lines (≥40
+characters) and candidates limited to lines of ≥12 characters, it behaved well on
+clean sources:
+
+| Page | Promoted | Correct |
+|---|---|---|
+| Scanned manual page | `CHOREOGRAPHED FLOOR PROGRESSION` | yes, plus one borderline false positive |
+| Synthetic report | all three headings | yes |
+| Synthetic manual | two of three headings | yes |
+| Product brochure | the headline and title | yes |
+| Concept map | nothing — abstained | yes |
+
+Two faults sank it.
+
+**It collapses on degraded sources.** On a photographed 1998 newspaper clipping
+it promoted **eleven** lines, most of them OCR noise: `nic ineinsidisoterskin`,
+`ses con sekiu.nlemiana`. Character widths vary wildly when recognition is
+uncertain, and degraded scans are precisely where OCR'd pages come from. A
+heuristic that works on clean input and fails on hard input is backwards.
+
+**Equal headings get unequal levels.** In the synthetic report, `Revenue and
+Margin` measured 1.65× baseline and `Operating Costs` 1.55× — identical 16 pt
+headings in the source. Any fixed band splits them into `##` and `###`, which
+tells a reader the second is subordinate to the first. Inconsistent structure
+misleads more than no structure does; flat text at least makes no false claims.
+
+### What would change the verdict
+
+Per-character geometry rather than per-line averages — Vision can return a
+bounding box for a character range, so cap height could be measured directly
+instead of inferred from average advance width. That is immune to both faults:
+it does not care about descenders, and it does not care how many characters a
+line has. It costs an extra request per line, which is why it was not tried here.
+
+Until then, scanned pages stay flat. The document title from
+`detect_pdf()` still gives them an H1, which is most of the practical benefit.

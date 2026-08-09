@@ -173,6 +173,9 @@ per-page state. Specifically:
   reported differently and raises a warning naming the pages.
 - Table and multi-column detection, currently surfaced in the log.
 
+Headings need no help: pdf-inspector already infers H1–H4 from font-size ratios,
+correctly declining marginal cases a naive threshold would promote.
+
 That leaves `extract_text_with_positions()` (coordinates, font sizes,
 bold/italic), `extract_text_in_regions()` and `extract_text()` unused.
 `process_pdf()` and `classify_pdf()` are covered by `detect_pdf()` above —
@@ -253,8 +256,11 @@ Good places to start, roughly in order of how much someone would thank you:
 - **Swap a stage.** The table above lists candidates. Replacing PyMuPDF with
   pypdfium2 would be a self-contained change behind an existing seam, and would
   settle the AGPL question.
-- **Use more of pdf-inspector.** Font sizes are right there and would give real
-  heading structure instead of trusting the emitted Markdown.
+- **Heading structure for scanned pages.** These come out of OCR flat. Note that
+  font-size inference has been tried and rejected — see MIGRATION.md §11 for the
+  measurements, including why bounding-box height and width-per-character both
+  fail. Per-character cap height via Vision is the untried approach that would
+  work.
 - **Classifier calibration.** The thresholds come from a small corpus of mostly
   English and Spanish documents. Handwriting, dense scientific figures and
   non-Latin scripts are unexplored. Measurements beat opinions here — see
