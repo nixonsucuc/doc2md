@@ -3,6 +3,10 @@
 Converts documents into LLM-ready Markdown. Text is extracted locally; a vision
 model is called only for diagrams that OCR cannot represent.
 
+doc2md is mostly orchestration. The hard parts — parsing PDFs, recognising
+characters, describing images — are other people's work, and it is worth knowing
+whose before relying on it: see [Built on](#built-on).
+
 ## Setup
 
 ```bash
@@ -120,7 +124,33 @@ Against Google AI Studio's free 250k/day that is ~93 images. Three guards:
 Every run prints what it is about to spend before spending it, and what it spent
 afterwards.
 
-## What we take from pdf-inspector
+
+## Diagram pages
+
+A page drawn in vectors — an infographic, a roadmap — has a real text layer, so
+it is never rasterized, and holds no embedded image, so nothing reaches the
+classifier. Its text used to come out in coordinate order, scrambled across the
+page. Such pages are now detected (many vector drawings, no embedded images,
+very short average line length), rendered, and sent to vision; a successful
+description replaces the scrambled text rather than sitting beside it.
+
+## Built on
+
+Very little of what doc2md does is doc2md's own code. It decides *which* tool to
+use, *when* a page needs escalating, and *whether* an API call is worth making —
+the actual extraction, recognition and description belong to the projects below.
+
+| | Doing what | Licence |
+|---|---|---|
+| [MarkItDown](https://github.com/microsoft/markitdown) (Microsoft) | DOCX, PPTX, EPUB, HTML, ZIP, `.msg`, and the PDF fallback | MIT |
+| [pdf-inspector](https://github.com/firecrawl/pdf-inspector) (Firecrawl) | Layout-aware PDF extraction in Rust: per-page Markdown, multi-column reading order, table detection, CID fonts, and the encoding and OCR-routing signals | MIT |
+| [Tesseract](https://github.com/tesseract-ocr/tesseract) via [pytesseract](https://github.com/madmaze/pytesseract) | All OCR | Apache 2.0 |
+| [PyMuPDF](https://pymupdf.readthedocs.io/) (Artifex) | Page rasterizing, image extraction, titles, link annotations | **AGPL-3.0 or commercial** |
+| [Pillow](https://pillow.readthedocs.io/) | Every pixel measurement the classifier makes | MIT-CMU |
+| [google-genai](https://github.com/googleapis/python-genai) | The vision calls | Apache 2.0 |
+| [langdetect](https://github.com/Mimino666/langdetect) | Picking the OCR language for a second pass | MIT |
+
+### What we use from pdf-inspector
 
 PDFs are routed through `pdf-inspector`, which is layout-aware and reports
 per-page state. Specifically:
@@ -134,6 +164,14 @@ per-page state. Specifically:
   reported differently and raises a warning naming the pages.
 - Table and multi-column detection, currently surfaced in the log.
 
+That is a fraction of what the library offers. `extract_text_with_positions()`
+(coordinates, font sizes, bold/italic), `extract_text_in_regions()` and
+`process_pdf()` all go unused. Font-size-based heading inference is the most
+promising of them and is on the contributing list. One thing already tested and
+ruled out: positional data cannot un-scramble a vector infographic — sorting by
+coordinates still yields `orga nizat ion!`, because the text is letter-spaced
+along a curve. That case genuinely needs the vision model.
+
 Two things come from PyMuPDF instead, which is already a dependency:
 
 - **The document's own title**, used as the H1 when the text supplies no heading
@@ -145,14 +183,34 @@ Two things come from PyMuPDF instead, which is already a dependency:
   loses the address entirely. The text under the link rectangle becomes the
   anchor when it reads as language, and a bare URL when it does not.
 
-## Diagram pages
+### A licence note worth reading
 
-A page drawn in vectors — an infographic, a roadmap — has a real text layer, so
-it is never rasterized, and holds no embedded image, so nothing reaches the
-classifier. Its text used to come out in coordinate order, scrambled across the
-page. Such pages are now detected (many vector drawings, no embedded images,
-very short average line length), rendered, and sent to vision; a successful
-description replaces the scrambled text rather than sitting beside it.
+doc2md's own code is MIT. **PyMuPDF is not** — it is dual-licensed under AGPL-3.0
+or a commercial licence from Artifex. The AGPL is strongly copyleft, so anyone
+distributing a combined work that includes PyMuPDF (a bundled app, a hosted
+service) needs either to honour the AGPL for the whole of it or to hold an
+Artifex licence. Installing it yourself from source, as the setup instructions
+do, is the ordinary case and is not affected.
+
+This is a statement of what the licences say, not legal advice. If it matters to
+you, [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) (Apache-2.0 /
+BSD-3) covers rendering and basic text extraction and would remove the question
+entirely — see below.
+
+### Swapping pieces out
+
+Every stage is a seam, and better tools keep appearing. Nothing here is a
+commitment:
+
+| Stage | Now | Worth trying |
+|---|---|---|
+| PDF text | pdf-inspector | [Docling](https://github.com/docling-project/docling), [Marker](https://github.com/datalab-to/marker), [unstructured](https://github.com/Unstructured-IO/unstructured) |
+| Rendering | PyMuPDF | [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) — also settles the licence question above |
+| OCR | Tesseract | [Apple Vision](https://developer.apple.com/documentation/vision) (free, on-device, already on every Mac this runs on), [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR), [Surya](https://github.com/datalab-to/surya) |
+| Vision | Gemini | Any vision model — `VISION_MODEL` is one line, and `analyze_with_vision()` is the only place the SDK is touched |
+
+The pipeline exists to make these choices independent of each other. If you
+replace one, the guards, budgets and reporting around it still apply.
 
 ## Contributing
 
@@ -181,6 +239,11 @@ Good places to start, roughly in order of how much someone would thank you:
 - **Linux and Windows.** Nothing in `doc2md.py` is macOS-specific, but every
   front-end is, and paths like `/opt/homebrew/bin` are assumed in the GUI
   wrappers.
+- **Swap a stage.** The table above lists candidates. Replacing Tesseract with
+  Apple Vision on macOS, or PyMuPDF with pypdfium2, would each be a self-contained
+  change behind an existing seam — and the second would settle the AGPL question.
+- **Use more of pdf-inspector.** Font sizes are right there and would give real
+  heading structure instead of trusting the emitted Markdown.
 - **Classifier calibration.** The thresholds come from a small corpus of mostly
   English and Spanish documents. Handwriting, dense scientific figures and
   non-Latin scripts are unexplored. Measurements beat opinions here — see
