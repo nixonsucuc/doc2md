@@ -317,6 +317,60 @@ class TestLinkMerging(unittest.TestCase):
         self.assertEqual(doc2md.usable_anchor("word " * 40), "")
 
 
+class TestOcrEngineSelection(FixtureCase):
+    """Apple Vision is preferred when built; Tesseract must stay a real fallback."""
+
+    def setUp(self):
+        self.original = doc2md.OCR_ENGINE
+        self.addCleanup(lambda: setattr(doc2md, "OCR_ENGINE", self.original))
+        doc2md.find_vision_ocr.cache_clear()
+        self.addCleanup(doc2md.find_vision_ocr.cache_clear)
+
+    def test_engine_setting_is_validated(self):
+        cfg_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, cfg_dir, ignore_errors=True)
+        path = cfg_dir / "c.json"
+        path.write_text(json.dumps({"ocr_engine": "magic"}))
+        self.assertNotIn("ocr_engine", doc2md.load_config(path))
+        path.write_text(json.dumps({"ocr_engine": "tesseract"}))
+        self.assertEqual(doc2md.load_config(path)["ocr_engine"], "tesseract")
+
+    def test_helper_is_ignored_off_macos(self):
+        with mock.patch.object(doc2md.sys, "platform", "linux"):
+            doc2md.find_vision_ocr.cache_clear()
+            self.assertEqual(doc2md.find_vision_ocr(), "")
+
+    def test_vision_failure_returns_empty_rather_than_raising(self):
+        """A crashed helper must never cost a page — the caller falls back."""
+        with mock.patch.object(doc2md, "find_vision_ocr", return_value="/bin/false"):
+            self.assertEqual(doc2md.ocr_with_vision(Path("x.png"), "eng"), "")
+
+    def test_missing_helper_returns_empty(self):
+        with mock.patch.object(doc2md, "find_vision_ocr", return_value=""):
+            self.assertEqual(doc2md.ocr_with_vision(Path("x.png"), "eng"), "")
+
+    def test_unreadable_helper_path_is_not_fatal(self):
+        with mock.patch.object(doc2md, "find_vision_ocr",
+                               return_value="/nonexistent/doc2md-ocr"):
+            self.assertEqual(doc2md.ocr_with_vision(Path("x.png"), "eng"), "")
+
+    @needs_tesseract
+    def test_auto_falls_back_when_vision_yields_nothing(self):
+        """The whole point of auto: an empty Vision result is not an empty page."""
+        doc2md.OCR_ENGINE = "auto"
+        with mock.patch.object(doc2md, "find_vision_ocr", return_value="/bin/false"):
+            text = doc2md.ocr_image(self.files["png"])
+        self.assertTrue(text.strip(), "should have fallen through to Tesseract")
+
+    def test_forced_vision_does_not_fall_back(self):
+        """Asking for one engine and silently getting the other hides problems."""
+        doc2md.OCR_ENGINE = "vision"
+        with mock.patch.object(doc2md, "find_vision_ocr", return_value="/bin/false"), \
+             mock.patch.object(doc2md.pytesseract, "image_to_string") as tess:
+            doc2md.ocr_image(self.files["png"])
+        tess.assert_not_called()
+
+
 class TestVisionBudget(unittest.TestCase):
     """Guards on what a single drag is allowed to spend."""
 

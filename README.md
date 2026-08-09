@@ -10,14 +10,20 @@ whose before relying on it: see [Built on](#built-on).
 ## Setup
 
 ```bash
-brew install tesseract
 pip3 install -e .
+./ocr/build.sh          # optional: Apple Vision OCR, ~2x faster than Tesseract
+brew install tesseract  # only needed if you skip the step above
 ```
 
 That installs the dependencies and puts a `doc2md` command on your PATH.
 
-Spanish OCR needs `spa.traineddata` in `$(brew --prefix)/share/tessdata/`.
-Do **not** install `tesseract-lang` — it adds ~1.3 GB of unused languages.
+With `./ocr/build.sh`, OCR goes through Apple Vision — no Homebrew package and no
+language files, since language support ships with macOS. Measurements and the
+engine setting are in [ocr/README.md](ocr/README.md).
+
+Using Tesseract instead, Spanish OCR needs `spa.traineddata` in
+`$(brew --prefix)/share/tessdata/`. Do **not** install `tesseract-lang` — it adds
+~1.3 GB of unused languages.
 
 For diagram descriptions, set a key. Without it, everything else still works.
 
@@ -144,7 +150,8 @@ the actual extraction, recognition and description belong to the projects below.
 |---|---|---|
 | [MarkItDown](https://github.com/microsoft/markitdown) (Microsoft) | DOCX, PPTX, EPUB, HTML, ZIP, `.msg`, and the PDF fallback | MIT |
 | [pdf-inspector](https://github.com/firecrawl/pdf-inspector) (Firecrawl) | Layout-aware PDF extraction in Rust: per-page Markdown, multi-column reading order, table detection, CID fonts, and the encoding and OCR-routing signals | MIT |
-| [Tesseract](https://github.com/tesseract-ocr/tesseract) via [pytesseract](https://github.com/madmaze/pytesseract) | All OCR | Apache 2.0 |
+| [Apple Vision](https://developer.apple.com/documentation/vision) | OCR, when `ocr/build.sh` has been run — the default on macOS | part of macOS |
+| [Tesseract](https://github.com/tesseract-ocr/tesseract) via [pytesseract](https://github.com/madmaze/pytesseract) | OCR fallback, and the only engine off macOS | Apache 2.0 |
 | [PyMuPDF](https://pymupdf.readthedocs.io/) (Artifex) | Page rasterizing, image extraction, titles, link annotations | **AGPL-3.0 or commercial** |
 | [Pillow](https://pillow.readthedocs.io/) | Every pixel measurement the classifier makes | MIT-CMU |
 | [google-genai](https://github.com/googleapis/python-genai) | The vision calls | Apache 2.0 |
@@ -155,18 +162,22 @@ the actual extraction, recognition and description belong to the projects below.
 PDFs are routed through `pdf-inspector`, which is layout-aware and reports
 per-page state. Specifically:
 
-- `classify_pdf()` as a pre-flight — 1–6 ms, because it samples content streams
-  rather than extracting. Reports the document type, page count, confidence, and
-  which pages will need OCR before any of the expensive work starts.
+- `detect_pdf()` as a pre-flight — ~7 ms, because it samples content streams
+  rather than extracting, and its `markdown` comes back empty by design. One call
+  gives the document type, the OCR forecast *and* the declared title, so it also
+  replaced a separate PyMuPDF read for the title: same answer on every sample
+  tested, one fewer parse, MIT rather than AGPL.
 - `extract_pages_markdown()` for the text, per page, with its `needs_ocr` flag
   and the *reason* behind it. A page flagged `suspected_garbled_text` has a text
   layer that is broken rather than absent — a different problem, so it is
   reported differently and raises a warning naming the pages.
 - Table and multi-column detection, currently surfaced in the log.
 
-That is a fraction of what the library offers. `extract_text_with_positions()`
-(coordinates, font sizes, bold/italic), `extract_text_in_regions()` and
-`process_pdf()` all go unused. Font-size-based heading inference is the most
+That leaves `extract_text_with_positions()` (coordinates, font sizes,
+bold/italic), `extract_text_in_regions()` and `extract_text()` unused.
+`process_pdf()` and `classify_pdf()` are covered by `detect_pdf()` above —
+`classify_pdf` is a cheaper subset, and `process_pdf` returns flat Markdown
+rather than the per-page structure the pipeline needs. Font-size-based heading inference is the most
 promising of them and is on the contributing list. One thing already tested and
 ruled out: positional data cannot un-scramble a vector infographic — sorting by
 coordinates still yields `orga nizat ion!`, because the text is letter-spaced
@@ -206,7 +217,7 @@ commitment:
 |---|---|---|
 | PDF text | pdf-inspector | [Docling](https://github.com/docling-project/docling), [Marker](https://github.com/datalab-to/marker), [unstructured](https://github.com/Unstructured-IO/unstructured) |
 | Rendering | PyMuPDF | [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) — also settles the licence question above |
-| OCR | Tesseract | [Apple Vision](https://developer.apple.com/documentation/vision) (free, on-device, already on every Mac this runs on), [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR), [Surya](https://github.com/datalab-to/surya) |
+| OCR | Apple Vision, falling back to Tesseract | [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR), [Surya](https://github.com/datalab-to/surya) |
 | Vision | Gemini | Any vision model — `VISION_MODEL` is one line, and `analyze_with_vision()` is the only place the SDK is touched |
 
 The pipeline exists to make these choices independent of each other. If you
@@ -239,9 +250,9 @@ Good places to start, roughly in order of how much someone would thank you:
 - **Linux and Windows.** Nothing in `doc2md.py` is macOS-specific, but every
   front-end is, and paths like `/opt/homebrew/bin` are assumed in the GUI
   wrappers.
-- **Swap a stage.** The table above lists candidates. Replacing Tesseract with
-  Apple Vision on macOS, or PyMuPDF with pypdfium2, would each be a self-contained
-  change behind an existing seam — and the second would settle the AGPL question.
+- **Swap a stage.** The table above lists candidates. Replacing PyMuPDF with
+  pypdfium2 would be a self-contained change behind an existing seam, and would
+  settle the AGPL question.
 - **Use more of pdf-inspector.** Font sizes are right there and would give real
   heading structure instead of trusting the emitted Markdown.
 - **Classifier calibration.** The thresholds come from a small corpus of mostly

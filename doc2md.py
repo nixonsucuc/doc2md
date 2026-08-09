@@ -29,6 +29,7 @@ import io
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 import zipfile
@@ -83,8 +84,13 @@ OCR_REASON_TEXT = {
 # the same file still overwrites in place. See claim_output_folder().
 SOURCE_MARKER = ".doc2md-source"
 
-# Tesseract default languages (fast first pass)
+# Tesseract default languages (fast first pass). Also fed to Apple Vision, which
+# maps them to BCP-47 itself, so one setting covers both engines.
 OCR_DEFAULT_LANGS = "eng+spa"
+
+# "auto" prefers Apple Vision when its helper is built and falls back to
+# Tesseract; "vision" and "tesseract" force one. See ocr/README.md.
+OCR_ENGINE = "auto"
 
 # Tesseract is tuned for roughly 300 dpi and degrades sharply below about 150 —
 # not gracefully, but to nothing at all. A 604×401 newspaper clipping returned
@@ -158,6 +164,7 @@ CONFIGURABLE: dict = {
     "vision_warn_threshold": ("VISION_WARN_THRESHOLD", int, lambda v: 0 <= v <= 500),
     "vision_daily_budget": ("VISION_DAILY_BUDGET", int, lambda v: v > 0),
     "ocr_languages": ("OCR_DEFAULT_LANGS", str, lambda v: bool(v.strip())),
+    "ocr_engine": ("OCR_ENGINE", str, lambda v: v in {"auto", "vision", "tesseract"}),
 }
 
 # ── Page-level diagram detection ──────────────────────────────────────────────
@@ -808,9 +815,64 @@ def upscale_for_ocr(img: Image.Image) -> Image.Image:
 
 
 
+@lru_cache(maxsize=1)
+def find_vision_ocr() -> str:
+    """
+    Locate the Apple Vision helper, if it has been built.
+
+    Optional by design: absent, everything falls back to Tesseract and nothing
+    else changes. Built by ocr/build.sh.
+    """
+    if sys.platform != "darwin":
+        return ""
+    candidates = [
+        Path(__file__).resolve().parent / "ocr" / "bin" / "doc2md-ocr",
+        Path.home() / ".local" / "bin" / "doc2md-ocr",
+        Path("/opt/homebrew/bin/doc2md-ocr"),
+        Path("/usr/local/bin/doc2md-ocr"),
+    ]
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return ""
+
+
+def ocr_with_vision(img_path: Path, lang_str: str) -> str:
+    """
+    Recognise text with Apple Vision, via the helper binary.
+
+    Measured against Tesseract on the sample corpus, at the same 200 dpi render:
+
+        scanned page   1388 chars in 1.6 s   vs 1359 in 3.6 s
+        brochure page  1283 chars in 0.4 s   vs 1286 in 0.8 s
+        concept map     350 chars in 0.3 s   vs  248 in 0.4 s
+        newspaper photo 721 chars in 0.4 s   vs    0 — Tesseract read nothing
+
+    Roughly twice as fast, never worse, and markedly better on degraded or
+    photographed sources, which is what it was built for. It also needs no
+    traineddata: language support is part of the OS.
+
+    Returns "" on any failure so the caller can fall back rather than lose a page.
+    """
+    binary = find_vision_ocr()
+    if not binary:
+        return ""
+    try:
+        completed = subprocess.run(
+            [binary, str(img_path), lang_str],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return completed.stdout.strip() if completed.returncode == 0 else ""
+
+
 def ocr_image(img_path: Path) -> str:
     """
-    Run Tesseract OCR with auto language detection.
+    Run OCR with auto language detection.
+
+    Apple Vision is preferred when its helper is present; Tesseract is the
+    fallback and the only option off macOS. Set ocr_engine to force one.
     1. First pass with eng+spa
     2. Detect language with langdetect
     3. Re-run with detected language if different
@@ -832,7 +894,16 @@ def ocr_image(img_path: Path) -> str:
         initial_langs = ["eng"]
     lang_str = "+".join(initial_langs)
 
-    # First pass
+    # First pass. Vision reads the file directly — it does its own scaling, so the
+    # upscale that Tesseract needs below 300 dpi is neither required nor helpful.
+    if OCR_ENGINE in ("auto", "vision") and find_vision_ocr():
+        text = ocr_with_vision(img_path, lang_str)
+        if text:
+            return text
+        if OCR_ENGINE == "vision":
+            return ""
+        logger.debug(f"  Vision returned nothing for {img_path.name}; trying Tesseract")
+
     try:
         text = pytesseract.image_to_string(pil_img, lang=lang_str).strip()
     except Exception as e:
@@ -1355,25 +1426,16 @@ def normalize_pdf_tables(markdown: str) -> str:
 
 
 # ── PDF Metadata ──────────────────────────────────────────────────────────────
-def read_pdf_title(input_path: Path) -> str:
+def usable_title(title: str | None) -> str:
     """
-    The title the PDF declares for itself, if it is worth using.
+    Keep a declared PDF title only when it is worth putting at the top.
 
-    Read through PyMuPDF, which is already a dependency, rather than
-    pdf-inspector's process_pdf() — that returns flat Markdown instead of the
-    per-page structure the pipeline needs, so using it would mean parsing twice.
-
-    Plenty of PDFs carry a useless title: the authoring tool's default, or the
-    original filename with an extension still attached. Those are rejected here,
+    Plenty of PDFs carry a useless one: the authoring tool's default, or the
+    original filename with its extension still attached. Those are rejected,
     because a wrong title is worse than none — it is the first line the model
     reads.
     """
-    try:
-        with fitz.open(str(input_path)) as doc:
-            title = ((doc.metadata or {}).get("title") or "").strip()
-    except Exception:
-        return ""
-
+    title = (title or "").strip()
     if len(title) < 3 or len(title) > 200:
         return ""
     lowered = title.lower()
@@ -1385,6 +1447,22 @@ def read_pdf_title(input_path: Path) -> str:
     if re.fullmatch(r"[\d\s.\-_]+", title):
         return ""
     return title
+
+
+def read_pdf_title(input_path: Path) -> str:
+    """
+    Fallback title reader, for PDFs that never reach pdf-inspector.
+
+    pdf-inspector's detect_pdf() supplies the title on the normal path and is
+    preferred: it is MIT where PyMuPDF is AGPL, and it is one call that also
+    yields the document type. This exists for the MarkItDown fallback, when the
+    native wheel is missing or has failed.
+    """
+    try:
+        with fitz.open(str(input_path)) as doc:
+            return usable_title((doc.metadata or {}).get("title"))
+    except Exception:
+        return ""
 
 
 def read_pdf_links(input_path: Path) -> dict[int, list[tuple[str, str]]]:
@@ -1477,16 +1555,21 @@ def _pdf_via_inspector(input_path: Path, report: ProcessingReport) -> DocumentSo
     0-based while the summary lists are 1-based — so page numbers are normalised
     to 0-based here, matching ImageInfo.source_page, and nowhere else.
     """
-    # Pre-flight. Costs 1–6 ms because it samples content streams rather than
-    # extracting, and it says up front what kind of document this is and how much
-    # of it will need OCR — which is the expensive part.
+    # Pre-flight. detect_pdf samples content streams instead of extracting — ~7 ms,
+    # and its markdown comes back empty by design — yet returns the full result
+    # object, so one call covers the document type, the OCR forecast *and* the
+    # declared title. Preferred over reading the title from PyMuPDF: same answer
+    # on every sample tested, one fewer parse, and MIT rather than AGPL.
+    title = ""
     try:
-        summary = pdf_inspector.classify_pdf(str(input_path))
+        summary = pdf_inspector.detect_pdf(str(input_path))
+        title = usable_title(summary.title)
         logger.info(
-            "  %s PDF, %d page(s), confidence %.2f%s"
+            "  %s PDF, %d page(s), confidence %.2f%s%s"
             % (summary.pdf_type, summary.page_count, summary.confidence,
                f", {len(summary.pages_needing_ocr)} needing OCR"
-               if summary.pages_needing_ocr else "")
+               if summary.pages_needing_ocr else "",
+               f" — {title!r}" if title else "")
         )
     except Exception:
         pass  # advisory only; extraction below is what actually matters
@@ -1538,7 +1621,7 @@ def _pdf_via_inspector(input_path: Path, report: ProcessingReport) -> DocumentSo
         markdown="\n\n".join(p.markdown for p in pages if p.markdown.strip()),
         pages=pages,
         page_count=len(pages),
-        title=read_pdf_title(input_path),
+        title=title,
     )
 
 

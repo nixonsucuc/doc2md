@@ -27,6 +27,7 @@ final class Store: ObservableObject {
     @Published var warnThreshold: Int
     @Published var dailyBudget: Int
     @Published var ocrLanguages: String
+    @Published var ocrEngine: String
     @Published var apiKey: String
 
     @Published var savedAt: Date?
@@ -47,6 +48,7 @@ final class Store: ObservableObject {
         "vision_warn_threshold": 20,
         "vision_daily_budget": 250_000,
         "ocr_languages": "eng+spa",
+        "ocr_engine": "auto",
     ]
 
     init() {
@@ -60,6 +62,7 @@ final class Store: ObservableObject {
         warnThreshold = num("vision_warn_threshold")
         dailyBudget = num("vision_daily_budget")
         ocrLanguages = str("ocr_languages")
+        ocrEngine = str("ocr_engine")
         apiKey = Store.readAPIKey()
     }
 
@@ -109,6 +112,7 @@ final class Store: ObservableObject {
             "vision_warn_threshold": warnThreshold,
             "vision_daily_budget": dailyBudget,
             "ocr_languages": ocrLanguages,
+            "ocr_engine": ocrEngine,
         ]
         do {
             try FileManager.default.createDirectory(
@@ -212,9 +216,19 @@ struct SettingsView: View {
             }
 
             Section("OCR") {
-                TextField("Tesseract languages", text: $store.ocrLanguages)
+                Picker("Engine", selection: $store.ocrEngine) {
+                    Text("Automatic").tag("auto")
+                    Text("Apple Vision").tag("vision")
+                    Text("Tesseract").tag("tesseract")
+                }
+                Text("Automatic prefers Apple Vision when its helper is built "
+                     + "(./ocr/build.sh) and falls back to Tesseract.")
+                    .font(.caption).foregroundStyle(.secondary)
+
+                TextField("Languages", text: $store.ocrLanguages)
                     .textFieldStyle(.roundedBorder)
-                Text("Language codes joined by +, e.g. eng+spa. Each needs its traineddata installed.")
+                Text("Language codes joined by +, e.g. eng+spa. Vision maps these itself; "
+                     + "Tesseract needs matching traineddata installed.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
