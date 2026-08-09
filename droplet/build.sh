@@ -39,6 +39,11 @@ if [ -f "$ICON_SRC" ]; then
   done
   iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/droplet.icns"
   rm -rf "$(dirname "$ICONSET")"
+
+  # osacompile ships an asset catalog holding the stock droplet artwork, and
+  # macOS prefers a catalog's icon over CFBundleIconFile — so droplet.icns is
+  # ignored until this is gone. It contains nothing else the applet needs.
+  rm -f "$APP/Contents/Resources/Assets.car"
   ok "applied icon"
 fi
 
@@ -50,6 +55,11 @@ plutil -replace CFBundleDocumentTypes -json \
 plutil -replace CFBundleName -string "doc2md" "$APP/Contents/Info.plist"
 plutil -replace CFBundleIdentifier -string "com.nixonsucuc.doc2md.droplet" "$APP/Contents/Info.plist"
 ok "declared accepted file types"
+
+# Every edit above invalidated the signature osacompile applied, and macOS will
+# not trust a bundle whose Info.plist no longer matches it. Re-sign ad-hoc, which
+# is all a locally built app run by its author needs.
+codesign --force --deep --sign - "$APP" 2>/dev/null && ok "re-signed" || true
 
 # The Finder caches app metadata aggressively; without a touch the new icon and
 # document types can take a relaunch to appear.
