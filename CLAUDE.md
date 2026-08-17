@@ -73,6 +73,15 @@ scrolling. The steps, in order:
    then reclassifies an image as `semantic` if its OCR came back as scattered
    fragments rather than prose (`ocr_looks_like_prose`) — a free decision at
    this point since OCR already ran.
+   Apple Vision also reports per-line geometry (`doc2md-ocr --json`), and
+   `apply_layout` uses it to rebuild paragraphs, headings and lists
+   (`reflow_layout`) and to strip running headers/footers
+   (`find_running_furniture`). That writes to `ImageInfo.ocr_markdown` and
+   deliberately leaves `ocr_text` as the flat one-line-per-line output: the
+   escalation heuristics above are tuned on that shape, and reflowing first makes
+   every page look like prose and silently disables escalation. Vision's reading
+   order is never re-sorted — it is already column-aware. See the `LAYOUT_*` and
+   `FURNITURE_*` constants, and the "Page layout" section of README.md.
 5. **Vision analysis** (`analyze_with_vision`, `plan_vision_budget`) — sends
    `semantic` images to Gemini, gated by three budgets tracked in
    `~/.config/doc2md/usage.json`: a per-run confirmation threshold

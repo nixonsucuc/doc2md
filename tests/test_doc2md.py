@@ -1399,3 +1399,257 @@ class TestReport(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ── Layout reconstruction ─────────────────────────────────────────────────────
+def line(text, x=0.10, y=0.50, w=0.40, h=0.013):
+    """A positioned OCR line, with body-text geometry by default."""
+    return doc2md.LayoutLine(text=text, x=x, y=y, width=w, height=h)
+
+
+def column(texts, top=0.90, pitch=0.02, x=0.10, w=0.40, h=0.013):
+    """A run of evenly spaced lines, as one column of body text."""
+    return [line(t, x=x, y=top - i * pitch, w=w, h=h) for i, t in enumerate(texts)]
+
+
+class TestLayoutReflow(unittest.TestCase):
+    """
+    Rebuilding structure from OCR geometry.
+
+    Without this the whole page arrives as one line per visual line, which
+    Markdown renders as a single run-on paragraph.
+    """
+
+    def test_wrapped_lines_become_one_paragraph(self):
+        out = doc2md.reflow_layout(column(["the cat sat", "on the mat"]))
+        self.assertEqual(out, "the cat sat on the mat")
+
+    def test_a_wide_gap_starts_a_new_paragraph(self):
+        lines = column(["first para", "still first"])
+        lines.append(line("second para", y=lines[-1].y - 0.05))
+        self.assertEqual(
+            doc2md.reflow_layout(lines), "first para still first\n\nsecond para"
+        )
+
+    def test_an_indented_line_starts_a_new_paragraph(self):
+        """Typeset books mark paragraphs by indent, not by extra leading."""
+        lines = column(["first para", "still first"])
+        lines.append(line("second para", x=0.14, y=lines[-1].y - 0.02))
+        self.assertIn("first\n\nsecond para", doc2md.reflow_layout(lines))
+
+    def test_a_block_quote_does_not_break_on_every_line(self):
+        """Every line is indented, so only the first may start a block."""
+        lines = column(["lead in"])
+        lines += column(["quoted one", "quoted two", "quoted three"],
+                        top=0.88, x=0.14)
+        out = doc2md.reflow_layout(lines)
+        self.assertIn("quoted one quoted two quoted three", out)
+
+    def test_reading_order_is_never_re_sorted(self):
+        """
+        Vision finishes the left column before the right, so its order is the
+        answer. Sorting by y would interleave the two.
+        """
+        lines = column(["left top", "left bottom"], top=0.90)
+        lines += column(["right top", "right bottom"], top=0.90, x=0.55)
+        out = doc2md.reflow_layout(lines)
+        self.assertLess(out.index("left bottom"), out.index("right top"))
+
+    def test_a_column_change_is_not_read_as_a_paragraph_gap(self):
+        lines = column(["left"], top=0.20)
+        lines += column(["right"], top=0.90, x=0.55)
+        self.assertEqual(doc2md.reflow_layout(lines), "left\n\nright")
+
+
+class TestLayoutHeadings(unittest.TestCase):
+    """
+    Box height is a poor proxy for font size — measured body text ranged
+    0.89–1.22× the median purely by which letters were on the line — so
+    headings are recognised structurally, not by size alone.
+    """
+
+    def test_an_all_caps_isolated_line_is_a_heading(self):
+        lines = [line("BREATHING", y=0.90, w=0.12)]
+        lines += column(["body text here", "and more of it"], top=0.84)
+        self.assertTrue(doc2md.reflow_layout(lines).startswith("## BREATHING"))
+
+    def test_a_short_body_line_is_not_promoted_by_height_alone(self):
+        """The exact failure that made the first version unusable."""
+        lines = column(["opening line of the paragraph"])
+        lines.append(line("tall but mid-sentence,", y=0.88, h=0.016, w=0.40))
+        self.assertNotIn("##", doc2md.reflow_layout(lines))
+
+    def test_a_line_ending_in_punctuation_is_never_a_heading(self):
+        lines = [line('like saying "yes."', y=0.90, w=0.10, h=0.02)]
+        lines += column(["body text"], top=0.84)
+        self.assertNotIn("##", doc2md.reflow_layout(lines))
+
+    def test_a_full_width_line_is_never_a_heading(self):
+        lines = [line("ORIENTAL thrust movement or circling in", y=0.90, w=0.40, h=0.02)]
+        lines += column(["body"], top=0.84)
+        self.assertNotIn("##", doc2md.reflow_layout(lines))
+
+    def test_larger_type_is_a_heading_without_being_all_caps(self):
+        lines = [line("The Ceiling", y=0.90, w=0.12, h=0.020)]
+        lines += column(["body text here", "and more of it"], top=0.84)
+        self.assertIn("## The Ceiling", doc2md.reflow_layout(lines))
+
+
+class TestLayoutLists(unittest.TestCase):
+    def test_a_numbered_list_keeps_its_own_numbers(self):
+        lines = column(["88. first step", "89. second step"], pitch=0.04)
+        out = doc2md.reflow_layout(lines)
+        self.assertIn("88. first step", out)
+        self.assertIn("89. second step", out)
+
+    def test_a_hanging_continuation_stays_with_its_item(self):
+        """The hanging indent of a list item is its shape, not a new block."""
+        lines = [line("89. reaching the right side", x=0.168, y=0.90)]
+        lines.append(line("over. Keep the shoulders down", x=0.240, y=0.88))
+        out = doc2md.reflow_layout(lines)
+        self.assertIn("89. reaching the right side over. Keep the shoulders down", out)
+
+    def test_bullets_are_normalised(self):
+        lines = column(["• alpha", "• beta"], pitch=0.04)
+        out = doc2md.reflow_layout(lines)
+        self.assertIn("- alpha", out)
+        self.assertIn("- beta", out)
+
+    def test_a_year_is_not_a_list_item(self):
+        self.assertIsNone(doc2md.list_marker("1998 was the year"))
+
+    def test_a_lone_marker_is_not_a_list_item(self):
+        self.assertIsNone(doc2md.list_marker("- "))
+
+    def test_a_split_visual_line_is_rejoined(self):
+        """Vision splits a line where spacing widens, as a hanging number does."""
+        lines = [line("91.", x=0.171, y=0.900, w=0.03)]
+        lines.append(line("Shift the rib cage back", x=0.219, y=0.896))
+        self.assertIn("91. Shift the rib cage back", doc2md.reflow_layout(lines))
+
+
+class TestHyphenation(unittest.TestCase):
+    def test_a_split_word_is_rejoined(self):
+        self.assertEqual(doc2md.join_wrapped("you need bet-", "ter muscles"),
+                         "you need better muscles")
+
+    def test_a_capitalised_continuation_keeps_its_hyphen(self):
+        """"Franco-" + "American" is a compound, not a broken word."""
+        self.assertEqual(doc2md.join_wrapped("the Franco-", "American treaty"),
+                         "the Franco-American treaty")
+
+    def test_ordinary_wrapping_just_adds_a_space(self):
+        self.assertEqual(doc2md.join_wrapped("the cat", "sat down"),
+                         "the cat sat down")
+
+    def test_dehyphenate_repairs_already_joined_text(self):
+        self.assertEqual(doc2md.dehyphenate("given that familiar- ity, I am"),
+                         "given that familiarity, I am")
+
+    def test_dehyphenate_leaves_list_markers_alone(self):
+        self.assertEqual(doc2md.dehyphenate("- item one"), "- item one")
+
+    def test_dehyphenate_leaves_spaced_dashes_alone(self):
+        self.assertEqual(doc2md.dehyphenate("the 1990s - and then"),
+                         "the 1990s - and then")
+
+
+class TestRunningFurniture(unittest.TestCase):
+    """
+    Headers and footers are identified by repetition, never by position alone:
+    on the sample corpus the bottom band routinely held body text, and one top
+    band held the real heading "MAKE YOU LAUGH".
+    """
+
+    def _page(self, header, body):
+        return [line(header, y=0.96, w=0.10)] + column(body, top=0.80)
+
+    def test_a_repeated_header_is_found(self):
+        pages = [self._page("Parallel Lives", ["body of page"]) for _ in range(4)]
+        self.assertIn(doc2md.furniture_key("Parallel Lives"),
+                      doc2md.find_running_furniture(pages))
+
+    def test_a_short_document_is_left_alone(self):
+        """Two pages cannot corroborate anything, so nothing is stripped."""
+        pages = [self._page("Parallel Lives", ["body"]) for _ in range(2)]
+        self.assertEqual(doc2md.find_running_furniture(pages), set())
+
+    def test_body_text_in_the_bottom_band_survives(self):
+        """A full-measure line is body text, however its wording repeats."""
+        pages = [
+            [line("the same closing sentence on every page", y=0.03, w=0.40)]
+            + column(["body"])
+            for _ in range(5)
+        ]
+        self.assertEqual(doc2md.find_running_furniture(pages), set())
+
+    def test_page_numbers_normalise_to_the_same_key(self):
+        self.assertEqual(doc2md.furniture_key("Chapter 12"),
+                         doc2md.furniture_key("Chapter 13"))
+
+    def test_a_heading_appearing_once_is_not_furniture(self):
+        pages = [self._page("MAKE YOU LAUGH", ["body"])]
+        pages += [self._page(f"other {n}", ["body"]) for n in range(4)]
+        self.assertNotIn(doc2md.furniture_key("MAKE YOU LAUGH"),
+                         doc2md.find_running_furniture(pages))
+
+    def test_stripping_records_the_page_number(self):
+        images = []
+        for n, folio in enumerate((48, 49, 50, 51)):
+            img = doc2md.ImageInfo(path=Path(f"/x/p{n}.png"))
+            img.layout_lines = [line(str(folio), y=0.96, w=0.02)] + column(
+                [f"body of page {n}"]
+            )
+            images.append(img)
+        doc2md.apply_layout(images)
+        self.assertEqual([i.page_number for i in images], ["48", "49", "50", "51"])
+        self.assertIn("<!-- page 48 -->", images[0].ocr_markdown)
+        self.assertNotIn("48", images[0].ocr_markdown.split("-->")[1])
+
+
+class TestPageNumberValidation(unittest.TestCase):
+    """
+    A wrong page marker is worse than none: its whole purpose is to be a citable
+    anchor. Page numbers ascend, so anything off the longest run is dropped.
+    """
+
+    def test_ocr_noise_is_dropped(self):
+        self.assertEqual(
+            doc2md.keep_consistent_page_numbers(
+                ["93", "97", "1101", "103", "104", "C", "106"]),
+            ["93", "97", "", "103", "104", "", "106"],
+        )
+
+    def test_gaps_are_allowed_because_these_are_page_drags(self):
+        self.assertEqual(
+            doc2md.keep_consistent_page_numbers(["2", "48", "70"]),
+            ["2", "48", "70"],
+        )
+
+    def test_roman_numerals_are_compared_by_value(self):
+        self.assertEqual(
+            doc2md.keep_consistent_page_numbers(["ix", "xi", "xiv"]),
+            ["ix", "xi", "xiv"],
+        )
+
+    def test_a_lone_letter_is_not_a_page_number(self):
+        self.assertEqual(doc2md.page_number_of("C"), "")
+
+    def test_a_number_beside_a_running_head_is_found(self):
+        self.assertEqual(doc2md.page_number_of("2 *Onkar Ghate*"), "2")
+
+
+class TestLayoutParsing(unittest.TestCase):
+    def test_json_lines_are_parsed(self):
+        payload = '{"x":0.1,"y":0.9,"w":0.4,"h":0.01,"c":1.0,"t":"hello"}'
+        parsed = doc2md.parse_layout_lines(payload)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].text, "hello")
+
+    def test_malformed_lines_are_skipped_not_fatal(self):
+        payload = 'not json\n{"x":0.1,"y":0.9,"w":0.4,"h":0.01,"c":1.0,"t":"ok"}'
+        self.assertEqual([l.text for l in doc2md.parse_layout_lines(payload)], ["ok"])
+
+    def test_plain_text_output_yields_no_geometry(self):
+        """An older helper ignores --json; the page must not come back empty."""
+        self.assertEqual(doc2md.parse_layout_lines("MAKE YOU LAUGH\nline two"), [])

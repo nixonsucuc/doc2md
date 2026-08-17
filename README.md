@@ -140,6 +140,67 @@ page. Such pages are now detected (many vector drawings, no embedded images,
 very short average line length), rendered, and sent to vision; a successful
 description replaces the scrambled text rather than sitting beside it.
 
+## Page layout
+
+OCR returns one line per visual line of text, and Markdown joins consecutive
+lines into a single paragraph — so writing that out unchanged turns a scanned
+page into one run-on block with no paragraphs, headings or lists. doc2md instead
+asks the OCR engine for each line's position and rebuilds the structure from it.
+
+| Signal | What it recovers |
+|---|---|
+| Vertical gap against the page's median line pitch | Paragraph and section breaks |
+| A line starting further right than the one above | Paragraph breaks in typeset books, which indent rather than add leading |
+| Line height, plus isolation and length | Headings |
+| A leading `1.` / `•` / `-`, plus the hanging indent below it | Lists, with continuation lines kept in their item |
+| A trailing hyphen | Words split across a line break, rejoined |
+
+Two findings shaped this and are worth knowing before tuning it:
+
+**Reading order is never re-sorted.** Vision emits observations in reading order
+and is already column-aware — it finishes the left column before starting the
+right. Sorting by vertical position *destroys* that ordering rather than
+establishing it, interleaving the two columns line by line.
+
+**Box height is a poor proxy for font size.** It spans ascenders to descenders,
+so it varies with which letters happen to be on the line. Measured across one
+page of body text it ranged 0.89–1.22× the median, while a real all-caps heading
+measured 1.10× — indistinguishable. Size alone therefore never promotes a line:
+it must also be short, isolated, unpunctuated and narrower than the text measure.
+
+Hyphen rejoining drops the hyphen when the continuation is lower-case
+(`bet-` + `ter` → `better`) and keeps it when capitalised, where it is far more
+often a real compound (`Franco-` + `American`).
+
+Verse is reflowed into paragraphs like anything else. Telling a poem from a
+wrapped paragraph needs a reliable right margin, and OCR'd scans do not have one.
+
+## Running headers and footers
+
+Repeated headers and footers are stripped, and their page numbers kept as
+`<!-- page 48 -->` markers.
+
+Repetition across pages is the only evidence used. Position alone is unsafe, and
+measurably so: on the sample corpus the bottom band of a page routinely holds
+ordinary body text, and one page's top band held the section heading
+`MAKE YOU LAUGH` in exactly the place a page number would sit. **A document of
+fewer than three pages is therefore left alone entirely** — a single page cannot
+corroborate anything, and leaving a running head in is far cheaper than deleting
+a paragraph of the source.
+
+The threshold is deliberately low. Running heads change per chapter: on a
+28-page sample the book title appeared on 24 pages but the chapter author on only
+8, so a majority rule would have caught the page numbers and missed every running
+head. A width test guards the other side — furniture ran 0.20× the median line
+width against body text at 1.00× — so a full-measure line of prose is never
+stripped however its wording repeats.
+
+Page numbers are validated against the fact that they ascend through a document:
+anything off the longest non-decreasing run is dropped. OCR misreads folios often
+enough to matter (one 13-page sample produced `1101`, `1115` and `C` among clean
+numbers), and a wrong marker is worse than none when its whole purpose is to be a
+citable anchor.
+
 ## Built on
 
 Very little of what doc2md does is doc2md's own code. It decides *which* tool to
@@ -180,11 +241,16 @@ That leaves `extract_text_with_positions()` (coordinates, font sizes,
 bold/italic), `extract_text_in_regions()` and `extract_text()` unused.
 `process_pdf()` and `classify_pdf()` are covered by `detect_pdf()` above —
 `classify_pdf` is a cheaper subset, and `process_pdf` returns flat Markdown
-rather than the per-page structure the pipeline needs. Font-size-based heading inference is the most
-promising of them and is on the contributing list. One thing already tested and
-ruled out: positional data cannot un-scramble a vector infographic — sorting by
-coordinates still yields `orga nizat ion!`, because the text is letter-spaced
-along a curve. That case genuinely needs the vision model.
+rather than the per-page structure the pipeline needs.
+
+Font-size-based heading inference was investigated and is **not** needed:
+`extract_pages_markdown()` already emits `# PART I: NON-CONTRADICTION` for a bold
+11pt line among 10pt body text. What the text-layer path was actually missing was
+end-of-line hyphenation (`familiar- ity`) and running headers, both now fixed —
+see [Page layout](#page-layout). One thing tested and ruled out: positional data
+cannot un-scramble a vector infographic — sorting by coordinates still yields
+`orga nizat ion!`, because the text is letter-spaced along a curve. That case
+genuinely needs the vision model.
 
 Two things come from PyMuPDF instead, which is already a dependency:
 
