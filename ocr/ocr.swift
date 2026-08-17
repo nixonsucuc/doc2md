@@ -1,10 +1,17 @@
 // doc2md-ocr — Apple Vision text recognition, as a command-line filter.
 //
-//     doc2md-ocr <image> [lang,lang,…]
+//     doc2md-ocr <image> [lang,lang,…] [--json]
 //
-// Prints recognised text to stdout, one line per observation, and exits 0. On
-// failure it prints nothing and exits non-zero, so the caller can fall back to
-// Tesseract without having to parse an error.
+// Prints recognised text to stdout, one line per observation, and exits 0. With
+// --json it prints one JSON object per line instead, carrying the bounding box
+// and confidence alongside the text. On failure it prints nothing and exits
+// non-zero, so the caller can fall back to Tesseract without parsing an error.
+//
+// The geometry is what lets the caller rebuild paragraphs, headings and lists:
+// plain text alone collapses a whole page into one run-on block, because
+// Markdown joins consecutive lines. Line height, the vertical gap to the
+// previous line, and the left edge are between them enough to tell a heading
+// from a paragraph break from a list item.
 //
 // Vision is on every Mac already: no Homebrew package, no traineddata files, no
 // language downloads. It also reads photographed and skewed pages that Tesseract
@@ -23,8 +30,36 @@ func fail(_ message: String) -> Never {
     exit(1)
 }
 
-let arguments = CommandLine.arguments
-guard arguments.count >= 2 else { fail("usage: doc2md-ocr <image> [lang,lang,…]") }
+/// Quote a string as a JSON scalar.
+///
+/// Hand-rolled rather than via JSONEncoder because encoding a bare string as a
+/// top-level fragment needs an availability dance for one line of escaping, and
+/// OCR output is plain recognised text — the only characters that can appear are
+/// the ones handled here.
+func encodeJSONString(_ value: String) -> String {
+    var out = "\""
+    for character in value.unicodeScalars {
+        switch character {
+        case "\"": out += "\\\""
+        case "\\": out += "\\\\"
+        case "\n": out += "\\n"
+        case "\r": out += "\\r"
+        case "\t": out += "\\t"
+        default:
+            if character.value < 0x20 {
+                out += String(format: "\\u%04x", character.value)
+            } else {
+                out.unicodeScalars.append(character)
+            }
+        }
+    }
+    return out + "\""
+}
+
+var arguments = CommandLine.arguments
+let wantsJSON = arguments.contains("--json")
+arguments.removeAll { $0 == "--json" }
+guard arguments.count >= 2 else { fail("usage: doc2md-ocr <image> [lang,lang,…] [--json]") }
 
 let path = arguments[1]
 // Tesseract-style codes in, BCP-47 out, so callers can keep using "eng+spa".
@@ -63,11 +98,28 @@ do {
 
 guard let observations = request.results else { exit(0) }
 
-// Observations arrive in reading order already, so no sorting is applied here.
-// Reconstructing layout is the caller's problem, exactly as it is with Tesseract.
+// Observations arrive in reading order already, and that order is column-aware:
+// on a two-column page Vision finishes the left column before starting the
+// right. Sorting by vertical position would therefore *destroy* the ordering
+// rather than establish it, interleaving the columns line by line. Nothing here
+// re-sorts, and callers should not either — the coordinates are for grouping
+// decisions, not for deciding sequence.
 var lines: [String] = []
 for observation in observations {
-    if let candidate = observation.topCandidates(1).first {
+    guard let candidate = observation.topCandidates(1).first else { continue }
+    if wantsJSON {
+        // Normalised coordinates, origin bottom-left, as Vision reports them.
+        let box = observation.boundingBox
+        let fields = [
+            "\"x\":\(String(format: "%.5f", box.origin.x))",
+            "\"y\":\(String(format: "%.5f", box.origin.y))",
+            "\"w\":\(String(format: "%.5f", box.size.width))",
+            "\"h\":\(String(format: "%.5f", box.size.height))",
+            "\"c\":\(String(format: "%.3f", candidate.confidence))",
+            "\"t\":\(encodeJSONString(candidate.string))",
+        ]
+        lines.append("{" + fields.joined(separator: ",") + "}")
+    } else {
         lines.append(candidate.string)
     }
 }

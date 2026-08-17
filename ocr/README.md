@@ -10,6 +10,29 @@ Tesseract. Without it nothing changes: doc2md uses Tesseract exactly as before.
 Builds `~/.local/bin/doc2md-ocr` with `swiftc`. doc2md finds it there, in
 `ocr/bin/`, or on the Homebrew/`/usr/local` paths.
 
+> **Rebuild required as of the layout release.** The helper now also reports
+> line geometry, which is what lets doc2md rebuild paragraphs, headings and lists
+> instead of emitting one run-on block per page. A helper built before this
+> ignores the new flag and prints plain lines; doc2md detects that and falls back
+> to flat text rather than failing, so nothing breaks — you simply keep the old
+> unstructured output until you re-run `./ocr/build.sh`.
+
+## Output
+
+```
+doc2md-ocr page.png eng+spa            # one line of text per observation
+doc2md-ocr page.png eng+spa --json     # one JSON object per observation
+```
+
+`--json` adds the bounding box and confidence:
+
+```json
+{"x":0.24045,"y":0.93304,"w":0.53483,"h":0.02336,"c":1.000,"t":"MAKE YOU LAUGH"}
+```
+
+Coordinates are normalised to the page, 0–1, origin bottom left — Vision's own
+convention, passed through unconverted.
+
 ## Why
 
 Measured against Tesseract on the sample corpus, at the same 200 dpi render:
@@ -54,5 +77,9 @@ BCP-47 itself, so one setting covers both engines.
   non-zero, so the caller falls back without parsing an error message.
 - **No upscaling.** Vision does its own scaling; the upscale Tesseract needs
   below 300 dpi is neither required nor helpful here.
-- Observations come back in reading order, so no sorting is applied —
-  reconstructing layout stays the caller's problem, exactly as with Tesseract.
+- **Observations come back in reading order, and nothing re-sorts them.** That
+  order is column-aware: on a two-column page Vision finishes the left column
+  before starting the right. Sorting by vertical position would therefore destroy
+  the ordering rather than establish it, interleaving the columns line by line.
+  The coordinates are for grouping decisions, not for deciding sequence — callers
+  should treat them the same way.

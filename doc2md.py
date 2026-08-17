@@ -122,6 +122,74 @@ PDF_OCR_MAX_LONG_SIDE = 2600
 # so JPEG suits them and PNG does not. Same page: 0.37 MB against 5.9 MB.
 PDF_OCR_RENDER_QUALITY = 85
 
+# ── Layout reconstruction ─────────────────────────────────────────────────────
+# OCR hands back one line per visual line of text. Markdown joins consecutive
+# lines into a single paragraph, so writing them out as-is turns a page into one
+# run-on block with no headings, paragraphs or lists. These thresholds drive
+# reflow_layout(), which rebuilds that structure from the line geometry.
+
+# A vertical gap this many times the page's median line pitch ends a paragraph.
+# Measured on the sample corpus: successive lines of one paragraph sit at
+# 1.00–1.15× pitch, while a paragraph break runs 1.5× and a section break 3–4×.
+# 1.4 sits in the empty space between the two populations.
+LAYOUT_PARA_GAP = 1.4
+
+# A line this many times the median line height counts as genuinely larger type.
+# Vision's box height spans ascenders to descenders, so it is a poor proxy for
+# font size: measured on one page of body text it ranged 0.89–1.22× the median
+# purely by which letters happened to be on the line, while the real heading
+# "HEAD" measured 1.10× — indistinguishable. The threshold therefore sits above
+# that observed noise ceiling, and size alone never promotes a line; it must
+# also be short, isolated and unpunctuated. All-caps headings, which are the
+# common case in scanned books and are *shorter* than body text for want of
+# descenders, are recognised structurally instead.
+LAYOUT_HEADING_HEIGHT = 1.3
+LAYOUT_HEADING_MAX_WORDS = 8
+# Headings do not fill the measure. A long line at heading size is body text in a
+# large font, which is a different thing, so width gates the decision too.
+LAYOUT_HEADING_MAX_WIDTH = 0.8
+
+# Vision emits observations in reading order, and that order is column-aware: on
+# a two-column page it finishes the left column before starting the right. A
+# backwards jump of at least this much therefore means a new column, not a new
+# paragraph. Sorting by y would destroy this ordering rather than establish it.
+LAYOUT_COLUMN_JUMP = 0.05
+
+# A line starting this much further right than the one above it opens a new
+# paragraph. Typeset books mark paragraphs by indenting the first line rather
+# than by leading extra space, so without this a whole page of a novel comes back
+# as one block: measured on a scanned page, body lines sat at x=0.066–0.069 and
+# every paragraph opening at x=0.092–0.097, against 0.003 of noise within a
+# column. Comparing against the previous line rather than a column edge keeps a
+# block quote — indented as a whole — from breaking on every one of its lines.
+LAYOUT_INDENT = 0.015
+
+# ── Running headers and footers ───────────────────────────────────────────────
+# The band at the top and bottom of a page in which furniture can live, as a
+# fraction of page height.
+FURNITURE_BAND = 0.08
+
+# How many pages a line must appear on, in the same band, before it is treated as
+# a running header or footer. Deliberately low: running heads change per chapter,
+# so on a 28-page sample the book title appeared on 24 pages but the chapter
+# author on only 8, and a majority threshold would have caught the page numbers
+# while missing every running head.
+FURNITURE_MIN_PAGES = 3
+
+# Never strip on a document too short for repetition to mean anything. A single
+# dropped page cannot corroborate anything, and positional guessing alone is
+# unsafe: on the sample corpus the bottom band routinely holds body text, and a
+# page-number-shaped band at the top held the real heading "MAKE YOU LAUGH".
+FURNITURE_MIN_DOC_PAGES = 3
+
+# Furniture does not fill the text measure. Measured across a 28-page scan, lines
+# in the top and bottom bands ran 0.20× the page's median line width while body
+# text ran 1.00×, and the tenth of band lines that were full width were body text
+# caught by the band — exactly what must survive. An independent guard alongside
+# repetition, so that a full-measure line of prose can never be stripped however
+# its wording happens to repeat.
+FURNITURE_MAX_WIDTH = 0.7
+
 # ── Vision budget ─────────────────────────────────────────────────────────────
 # Measured against gemini-3.6-flash on a rendered A4 page: 1155 input (prompt +
 # image) + 1248 thinking + 277 output = 2680. Thinking is the largest single
@@ -282,6 +350,12 @@ class ImageInfo:
     # A page rendered because it is a diagram: its text layer is scrambled, so a
     # successful description should replace that text rather than sit beside it.
     replaces_page_text: bool = False
+    # Positioned OCR lines, when the engine reported geometry, and the structured
+    # Markdown rebuilt from them. ocr_text keeps the flat output either way: the
+    # classification heuristics are tuned on that shape. See apply_layout().
+    layout_lines: list = field(default_factory=list)
+    ocr_markdown: str = ""
+    page_number: str = ""             # recovered from a stripped running footer
 
 
 @dataclass
@@ -780,16 +854,21 @@ def run_ocr_batch(images: list[ImageInfo]) -> None:
     without contending for the GIL. Falls back to a serial loop for a single
     image, where the pool would only add overhead.
     """
+    def run(img: ImageInfo) -> None:
+        # Each image gets its own list, so the pool never shares one.
+        lines: list[LayoutLine] = []
+        img.ocr_text = ocr_image(img.path, lines)
+        img.layout_lines = lines
+
     if not images:
         return
     if len(images) == 1:
-        images[0].ocr_text = ocr_image(images[0].path)
+        run(images[0])
         return
 
     workers = min(OCR_MAX_WORKERS, len(images))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for img, text in zip(images, pool.map(lambda i: ocr_image(i.path), images)):
-            img.ocr_text = text
+        list(pool.map(run, images))
 
 
 def upscale_for_ocr(img: Image.Image) -> Image.Image:
@@ -837,9 +916,15 @@ def find_vision_ocr() -> str:
     return ""
 
 
-def ocr_with_vision(img_path: Path, lang_str: str) -> str:
+def ocr_with_vision(img_path: Path, lang_str: str,
+                    layout: list | None = None) -> str:
     """
     Recognise text with Apple Vision, via the helper binary.
+
+    Pass a list as ``layout`` to also collect per-line geometry; it costs nothing
+    extra, since the helper reports both from the same recognition pass, and it
+    is what reflow_layout() needs to rebuild paragraphs and headings. Callers
+    that only want the text leave it out and are unaffected.
 
     Measured against Tesseract on the sample corpus, at the same 200 dpi render:
 
@@ -857,32 +942,44 @@ def ocr_with_vision(img_path: Path, lang_str: str) -> str:
     binary = find_vision_ocr()
     if not binary:
         return ""
+    command = [binary, str(img_path), lang_str]
+    if layout is not None:
+        command.append("--json")
     try:
         completed = subprocess.run(
-            [binary, str(img_path), lang_str],
-            capture_output=True, text=True, timeout=120,
+            command, capture_output=True, text=True, timeout=120,
         )
     except (OSError, subprocess.SubprocessError):
         return ""
-    return completed.stdout.strip() if completed.returncode == 0 else ""
+    if completed.returncode != 0:
+        return ""
+    if layout is None:
+        return completed.stdout.strip()
+
+    # A helper predating --json ignores the flag and prints plain lines. Parsing
+    # yields nothing then, so the text is taken from the raw output and the page
+    # simply goes unstructured rather than coming back empty.
+    lines = parse_layout_lines(completed.stdout)
+    if not lines:
+        return completed.stdout.strip()
+    layout.extend(lines)
+    return "\n".join(line.text for line in lines).strip()
 
 
-def ocr_image(img_path: Path) -> str:
+def ocr_image(img_path: Path, layout: list | None = None) -> str:
     """
     Run OCR with auto language detection.
 
     Apple Vision is preferred when its helper is present; Tesseract is the
     fallback and the only option off macOS. Set ocr_engine to force one.
+
+    Pass a list as ``layout`` to collect per-line geometry alongside the text.
+    Only Vision reports it; a Tesseract result leaves the list empty, and the
+    page keeps its flat unstructured text rather than failing.
     1. First pass with eng+spa
     2. Detect language with langdetect
     3. Re-run with detected language if different
     """
-    try:
-        pil_img = upscale_for_ocr(Image.open(img_path))
-    except Exception as e:
-        logger.warning(f"Cannot open image for OCR: {img_path.name} ({e})")
-        return ""
-
     available_langs = available_ocr_languages()
 
     # Build initial language string from what's available
@@ -897,34 +994,46 @@ def ocr_image(img_path: Path) -> str:
     # First pass. Vision reads the file directly — it does its own scaling, so the
     # upscale that Tesseract needs below 300 dpi is neither required nor helpful.
     if OCR_ENGINE in ("auto", "vision") and find_vision_ocr():
-        text = ocr_with_vision(img_path, lang_str)
+        text = ocr_with_vision(img_path, lang_str, layout)
         if text:
             return text
         if OCR_ENGINE == "vision":
             return ""
         logger.debug(f"  Vision returned nothing for {img_path.name}; trying Tesseract")
 
+    # Decoded here rather than at the top of the function: only Tesseract needs
+    # the pixels. Vision reads the file itself and does its own scaling, so on
+    # the default path this decode — and the upscale after it — never happen.
     try:
-        text = pytesseract.image_to_string(pil_img, lang=lang_str).strip()
+        with Image.open(img_path) as opened:
+            pil_img = upscale_for_ocr(opened)
+            text = pytesseract.image_to_string(pil_img, lang=lang_str).strip()
+
+            if not text or len(text) < 5:
+                return text
+
+            # Auto-detect language and re-run if needed. Inside the `with`, since
+            # the re-run needs the same decoded image.
+            if HAS_LANGDETECT:
+                try:
+                    detected = langdetect_detect(text)
+                    tess_lang = LANG_MAP.get(detected)
+                    if (tess_lang and tess_lang not in initial_langs
+                            and tess_lang in available_langs):
+                        logger.info(
+                            f"  Re-running OCR with detected language: "
+                            f"{detected} → {tess_lang}"
+                        )
+                        text = pytesseract.image_to_string(
+                            pil_img, lang=tess_lang
+                        ).strip()
+                except Exception:
+                    pass  # langdetect can fail on short or ambiguous text
+
+            return text
     except Exception as e:
-        logger.warning(f"OCR failed for {img_path.name}: {e}")
+        logger.warning(f"Cannot read image for OCR: {img_path.name} ({e})")
         return ""
-
-    if not text or len(text) < 5:
-        return text
-
-    # Auto-detect language and re-run if needed
-    if HAS_LANGDETECT:
-        try:
-            detected = langdetect_detect(text)
-            tess_lang = LANG_MAP.get(detected)
-            if tess_lang and tess_lang not in initial_langs and tess_lang in available_langs:
-                logger.info(f"  Re-running OCR with detected language: {detected} → {tess_lang}")
-                text = pytesseract.image_to_string(pil_img, lang=tess_lang).strip()
-        except Exception:
-            pass  # langdetect can fail on short or ambiguous text
-
-    return text
 
 
 def ocr_looks_like_prose(text: str) -> bool:
@@ -962,6 +1071,505 @@ def should_escalate_to_vision(img: ImageInfo) -> bool:
         # escalating on no evidence would send private photos to the API.
         return False  # Too little structure to be a diagram worth describing
     return not ocr_looks_like_prose(img.ocr_text)
+
+
+# ── Layout Reconstruction ────────────────────────────────────────────────────
+@dataclass
+class LayoutLine:
+    """
+    One recognised line of text, with the geometry needed to place it.
+
+    Coordinates are normalised to the page, 0–1, with the origin at the bottom
+    left — Vision's convention, kept rather than converted so that anyone
+    comparing this against the helper's output sees the same numbers.
+    """
+    text: str
+    x: float = 0.0        # left edge
+    y: float = 0.0        # bottom edge
+    width: float = 0.0
+    height: float = 0.0
+    confidence: float = 1.0
+
+
+def parse_layout_lines(payload: str) -> list[LayoutLine]:
+    """
+    Read the JSON-lines geometry emitted by ``doc2md-ocr --json``.
+
+    Malformed lines are skipped rather than raising: a page whose geometry cannot
+    be read should fall back to flat text, not lose its content altogether.
+    """
+    lines: list[LayoutLine] = []
+    for raw in payload.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            item = json.loads(raw)
+            lines.append(LayoutLine(
+                text=str(item["t"]),
+                x=float(item.get("x", 0.0)),
+                y=float(item.get("y", 0.0)),
+                width=float(item.get("w", 0.0)),
+                height=float(item.get("h", 0.0)),
+                confidence=float(item.get("c", 1.0)),
+            ))
+        except (ValueError, KeyError, TypeError):
+            continue
+    return lines
+
+
+# A leading list marker: a bullet glyph, or a number/letter followed by . or ).
+# Anchored and deliberately narrow — anything looser starts treating "1998 was"
+# and initials like "J. Smith" as list items.
+LIST_MARKER_RE = re.compile(
+    r"^\s*(?:([•·◦‣▪–—*+-])|(\d{1,3})[.)]|([a-z])[.)])\s+(?=\S)"
+)
+
+
+def list_marker(text: str) -> tuple[str, str] | None:
+    """
+    Split a line into (markdown marker, remaining text) when it opens a list item.
+
+    Returns None for ordinary lines. Numbered items keep their own number so a
+    list starting at 3 still reads as 3; bullets are normalised to "-".
+    """
+    match = LIST_MARKER_RE.match(text)
+    if not match:
+        return None
+    bullet, number, letter = match.groups()
+    rest = text[match.end():].strip()
+    if not rest:
+        return None  # A lone marker is a stray glyph, not a list item.
+    if number:
+        return f"{number}.", rest
+    if letter:
+        return f"{letter}.", rest
+    return "-", rest
+
+
+# Punctuation that a heading does not end on. A trailing comma, colon or full
+# stop means the line is part of a sentence, however short and however large it
+# measured; a trailing hyphen means it is a word broken across a line break.
+HEADING_TRAILING_PUNCTUATION = ",;:.!?-–—"
+
+
+def looks_like_heading(text: str) -> bool:
+    """
+    Whether a line's *wording* could be a heading, ignoring its geometry.
+
+    Only ever used to veto: a line that reads like part of a sentence is not
+    promoted no matter how it measures. Geometry decides the rest.
+    """
+    text = text.strip()
+    if not text or len(text.split()) > LAYOUT_HEADING_MAX_WORDS:
+        return False
+    if text.rstrip('"\'’”').endswith(tuple(HEADING_TRAILING_PUNCTUATION)):
+        return False
+    return any(character.isalpha() for character in text)
+
+
+def join_wrapped(previous: str, addition: str) -> str:
+    """
+    Append a wrapped line to the one above it, repairing a split word.
+
+    A trailing hyphen is dropped when the continuation is lower-case, which is
+    ordinary end-of-line hyphenation ("bet-" + "ter" → "better"). It is kept when
+    the continuation is capitalised, because that is far more often a real
+    compound broken across lines ("Franco-" + "American") than a hyphenated word
+    that happens to resume with a capital.
+    """
+    if previous.endswith("-") and addition[:1].isalpha():
+        if addition[:1].islower():
+            return previous[:-1] + addition
+        return previous + addition
+    return previous + " " + addition
+
+
+def _median(values: list[float], fallback: float) -> float:
+    return statistics.median(values) if values else fallback
+
+
+def reflow_layout(lines: list[LayoutLine]) -> str:
+    """
+    Rebuild paragraphs, headings and lists from positioned OCR lines.
+
+    Reading order is taken as given and never re-sorted — see LAYOUT_COLUMN_JUMP.
+    Decisions come from four signals: the vertical gap to the previous line
+    (section breaks), the left edge against the line above (paragraph breaks in
+    typeset books, which indent rather than add leading), the line's height and
+    isolation (headings), and a leading marker glyph (lists).
+
+    Verse and other hard-wrapped text is reflowed into paragraphs like anything
+    else. Distinguishing a poem from a wrapped paragraph needs the right margin
+    to be reliable, and on OCR'd scans it is not; running the two together costs
+    a line break, while the alternative costs paragraph structure on every page.
+    """
+    lines = [ln for ln in lines if ln.text.strip()]
+    if not lines:
+        return ""
+
+    gaps = [
+        lines[i - 1].y - lines[i].y
+        for i in range(1, len(lines))
+        if 0 < lines[i - 1].y - lines[i].y < 0.1
+    ]
+    pitch = _median(gaps, 0.02)
+    median_height = _median([ln.height for ln in lines], 0.02)
+    median_width = _median([ln.width for ln in lines], 1.0)
+
+    blocks: list[str] = []
+    paragraph = ""
+    pending_marker = ""
+    marker_x = 0.0
+
+    def flush() -> None:
+        nonlocal paragraph, pending_marker
+        if paragraph:
+            blocks.append(f"{pending_marker} {paragraph}" if pending_marker else paragraph)
+        paragraph = ""
+        pending_marker = ""
+
+    for index, line in enumerate(lines):
+        text = line.text.strip()
+        delta = lines[index - 1].y - line.y if index else 0.0
+
+        new_column = index > 0 and delta < -LAYOUT_COLUMN_JUMP
+        # Two observations at nearly the same height are two halves of one visual
+        # line — Vision splits a line whenever the spacing widens, which a hanging
+        # list number reliably does. Never a break, whatever the indents say.
+        # Measured against the line's own height rather than the page pitch: the
+        # pitch is a median over the whole page and says nothing useful on a page
+        # with only a handful of lines, while half a line height is the same
+        # question the eye asks — do these two boxes sit at the same level?
+        # abs(), because either half may be reported a hair higher than the other;
+        # a real column change is an order of magnitude further and cannot be
+        # mistaken for one here.
+        overlap = max(line.height, lines[index - 1].height if index else 0) * 0.5
+        same_line = index > 0 and abs(delta) < overlap
+        separated = delta > pitch * LAYOUT_PARA_GAP
+        indented = (
+            index > 0
+            and not new_column
+            and not same_line
+            and line.x > lines[index - 1].x + LAYOUT_INDENT
+        )
+        marker = list_marker(text)
+
+        # Inside a list item, the hanging indent of a continuation line is the
+        # normal shape of the item, not the start of something new — measured at
+        # 0.072 on one sample, far past the paragraph-indent threshold. The item
+        # ends at the next marker, a wide gap, a column change, or an outdent
+        # back to where the marker itself began.
+        if pending_marker and not marker and not separated and not new_column:
+            indented = indented and line.x + LAYOUT_INDENT < marker_x
+
+        # Isolation on both sides is the signal that survives OCR. A heading sits
+        # in its own whitespace; a short body line does not, and the line below a
+        # heading starts a paragraph rather than continuing one.
+        below = lines[index + 1] if index + 1 < len(lines) else None
+        gap_below = line.y - below.y if below else 1.0
+        isolated_above = index == 0 or new_column or separated or indented
+        isolated_below = gap_below > pitch * LAYOUT_PARA_GAP or gap_below < 0
+
+        is_heading = (
+            not marker
+            and not same_line
+            and looks_like_heading(text)
+            and line.width < median_width * LAYOUT_HEADING_MAX_WIDTH
+            and isolated_above
+            and (
+                # Genuinely larger type, or the all-caps section head that
+                # measures no taller than body text but stands alone.
+                line.height > median_height * LAYOUT_HEADING_HEIGHT
+                or (text == text.upper() and isolated_below)
+            )
+        )
+
+        if new_column or separated or indented or is_heading or marker:
+            flush()
+
+        if is_heading:
+            blocks.append(f"## {text}")
+            continue
+        if marker:
+            pending_marker, text = marker
+            marker_x = line.x
+
+        paragraph = join_wrapped(paragraph, text) if paragraph else text
+
+    flush()
+    return "\n\n".join(blocks)
+
+
+# Digits and roman numerals are replaced before comparing lines across pages, so
+# that "page 12" and "page 13" count as the same running footer. Roman numerals
+# are matched only as whole words to keep "I" and "did" apart from real numbering.
+FURNITURE_DIGITS_RE = re.compile(r"\d+")
+FURNITURE_ROMAN_RE = re.compile(r"\b[ivxlcdm]{1,7}\b", re.IGNORECASE)
+FURNITURE_NOISE_RE = re.compile(r"[^\w#]+")
+# Roman numerals need two characters at least. A lone "C" or "I" is far more
+# often a misread letter from a running head than a page number.
+PAGE_NUMBER_RE = re.compile(r"^[^\w]*(\d{1,4}|[ivxlcdm]{2,7})[^\w]*$", re.IGNORECASE)
+# A page number sharing its line with a running head, as "12  Chapter Title" or
+# "Chapter Title  12". Only ever applied to a line already known to be furniture,
+# where a number at the edge cannot be anything else.
+EDGE_NUMBER_RE = re.compile(
+    r"^[^\w]*(\d{1,4}|[ivxlcdm]{2,7})\b|\b(\d{1,4}|[ivxlcdm]{2,7})[^\w]*$",
+    re.IGNORECASE,
+)
+
+ROMAN_VALUES = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+# Markdown emphasis around a running head, which pdf-inspector adds for italics.
+MARKDOWN_EMPHASIS_RE = re.compile(r"[*_`]+")
+
+
+def furniture_key(text: str) -> str:
+    """
+    Normalise a line so the same running header matches itself across pages.
+
+    Page numbers vary by definition, so digits and roman numerals collapse to a
+    marker; punctuation and case are dropped because OCR is inconsistent about
+    both. What survives is the wording, which is what actually repeats.
+    """
+    key = FURNITURE_DIGITS_RE.sub("#", text.strip().lower())
+    key = FURNITURE_ROMAN_RE.sub("#", key)
+    return FURNITURE_NOISE_RE.sub("", key)
+
+
+def page_number_of(text: str) -> str:
+    """
+    The page number in a line of furniture, or "" if there is not one.
+
+    Accepts a line that is only a number, and a number sitting at either edge of
+    a running head. The looser edge match is safe only because the caller has
+    already established, from repetition, that the line is furniture.
+    """
+    text = MARKDOWN_EMPHASIS_RE.sub("", text).strip()
+    match = PAGE_NUMBER_RE.match(text)
+    if match:
+        return match.group(1)
+    match = EDGE_NUMBER_RE.search(text)
+    if match:
+        return match.group(1) or match.group(2)
+    return ""
+
+
+def page_number_value(text: str) -> int | None:
+    """Read a page number as an integer, accepting arabic or roman."""
+    text = text.strip().lower()
+    if text.isdigit():
+        return int(text)
+    if not text or any(character not in ROMAN_VALUES for character in text):
+        return None
+    total = 0
+    for position, character in enumerate(text):
+        value = ROMAN_VALUES[character]
+        following = [ROMAN_VALUES[c] for c in text[position + 1:]]
+        total += -value if following and value < max(following) else value
+    return total
+
+
+def keep_consistent_page_numbers(numbers: list[str]) -> list[str]:
+    """
+    Blank out page numbers that break the document's own ordering.
+
+    OCR misreads folios often enough to matter — one 13-page sample produced
+    "1101", "1115" and "C" among otherwise clean numbers — and a wrong page
+    marker is worse than none, because its whole purpose is to be a citable
+    anchor. Page numbers ascend through a document, so the longest non-decreasing
+    run is kept and everything off it is dropped.
+
+    Pages are not required to be consecutive: these documents are page drags, so
+    gaps are normal and only the direction is checked.
+    """
+    values = [page_number_value(number) if number else None for number in numbers]
+    indexes = [i for i, value in enumerate(values) if value is not None]
+    if len(indexes) < 2:
+        return numbers
+
+    # Longest non-decreasing subsequence over the candidates, by index.
+    best: list[int] = []
+    previous: dict[int, int | None] = {}
+    for i in indexes:
+        chain = [j for j in best if values[j] <= values[i]]
+        base = chain[-1] if chain else None
+        previous[i] = base
+        length = (best.index(base) + 1) if base is not None else 0
+        if length == len(best):
+            best.append(i)
+        else:
+            best[length] = i
+
+    keep: set[int] = set()
+    walk: int | None = best[-1] if best else None
+    while walk is not None:
+        keep.add(walk)
+        walk = previous[walk]
+
+    return [
+        number if index in keep else ""
+        for index, number in enumerate(numbers)
+    ]
+
+
+# End-of-line hyphenation, once the line break itself is gone: pdf-inspector
+# joins wrapped lines with a space and leaves the hyphen, giving "familiar- ity".
+HYPHEN_WRAP_RE = re.compile(r"(\w)-\s+(\w)")
+
+
+def dehyphenate(text: str) -> str:
+    """
+    Repair words split across a line break in already-joined text.
+
+    Same rule as join_wrapped(): the hyphen goes when the continuation is
+    lower-case, and stays when it is capitalised, where it is far more often a
+    real compound. Requires a word character immediately before the hyphen, so
+    Markdown list markers and spaced dashes are left alone.
+    """
+    def repair(match: re.Match) -> str:
+        head, tail = match.group(1), match.group(2)
+        return head + tail if tail.islower() else f"{head}-{tail}"
+
+    return HYPHEN_WRAP_RE.sub(repair, text)
+
+
+def strip_text_layer_furniture(pages: list["PdfPageInfo"]) -> int:
+    """
+    Remove running headers and footers from a PDF that has a real text layer.
+
+    Only the first and last non-empty line of each page are ever candidates —
+    that is where furniture lives, and restricting it there means a header that
+    got merged into a paragraph is left alone rather than cut out of the middle
+    of the prose. As with the OCR path, repetition across pages is the evidence
+    and a short document is untouched.
+    """
+    if len(pages) < FURNITURE_MIN_DOC_PAGES:
+        return 0
+
+    edges: list[set[str]] = []
+    seen: dict[str, set[int]] = {}
+    for index, page in enumerate(pages):
+        lines = [line for line in page.markdown.splitlines() if line.strip()]
+        candidates = {lines[0], lines[-1]} if lines else set()
+        edges.append(candidates)
+        for line in candidates:
+            seen.setdefault(furniture_key(line), set()).add(index)
+
+    drop = {
+        key for key, page_numbers in seen.items()
+        if key and len(page_numbers) >= FURNITURE_MIN_PAGES
+    }
+    if not drop:
+        return 0
+
+    removed = 0
+    bodies: list[str] = []
+    numbers: list[str] = []
+    for index, page in enumerate(pages):
+        kept: list[str] = []
+        number = ""
+        for line in page.markdown.splitlines():
+            if line in edges[index] and furniture_key(line) in drop:
+                removed += 1
+                number = number or page_number_of(line)
+                continue
+            kept.append(line)
+        bodies.append("\n".join(kept).strip())
+        numbers.append(number)
+
+    for page, body, number in zip(pages, bodies,
+                                  keep_consistent_page_numbers(numbers)):
+        page.markdown = f"<!-- page {number} -->\n\n{body}" if number and body else body
+    return removed
+
+
+def find_running_furniture(pages: list[list[LayoutLine]]) -> set[str]:
+    """
+    Identify running headers and footers by what repeats across pages.
+
+    Repetition is the whole of the evidence. Position alone is not enough: on the
+    sample corpus the bottom band of a page routinely holds ordinary body text,
+    and one page's top band held the section heading "MAKE YOU LAUGH" in exactly
+    the place a page number would sit. Stripping either would be worse than
+    leaving a running head in, so a short document is left entirely alone.
+    """
+    if len(pages) < FURNITURE_MIN_DOC_PAGES:
+        return set()
+
+    seen: dict[str, set[int]] = {}
+    for number, lines in enumerate(pages):
+        measure = _median([ln.width for ln in lines if ln.text.strip()], 1.0)
+        for line in lines:
+            if not line.text.strip():
+                continue
+            in_band = line.y >= 1.0 - FURNITURE_BAND or line.y <= FURNITURE_BAND
+            if in_band and line.width < measure * FURNITURE_MAX_WIDTH:
+                seen.setdefault(furniture_key(line.text), set()).add(number)
+
+    return {
+        key for key, page_numbers in seen.items()
+        if key and len(page_numbers) >= FURNITURE_MIN_PAGES
+    }
+
+
+def strip_running_furniture(images: list["ImageInfo"]) -> int:
+    """
+    Drop repeated headers and footers from every OCR'd page of a document.
+
+    Page numbers survive as HTML comments: once a line is known to be furniture,
+    recognising a bare numeral in it is free, and keeping the number preserves a
+    citable anchor that the surrounding prose has no other way to express.
+    """
+    pages = [img for img in images if img.layout_lines]
+    if len(pages) < FURNITURE_MIN_DOC_PAGES:
+        return 0
+
+    drop = find_running_furniture([img.layout_lines for img in pages])
+    if not drop:
+        return 0
+
+    removed = 0
+    for img in pages:
+        kept: list[LayoutLine] = []
+        numbers: list[str] = []
+        for line in img.layout_lines:
+            if furniture_key(line.text) in drop:
+                removed += 1
+                number = page_number_of(line.text)
+                if number:
+                    numbers.append(number)
+            else:
+                kept.append(line)
+        img.layout_lines = kept
+        img.page_number = numbers[0] if numbers else ""
+
+    for img, number in zip(pages, keep_consistent_page_numbers(
+            [img.page_number for img in pages])):
+        img.page_number = number
+    return removed
+
+
+def apply_layout(images: list["ImageInfo"]) -> int:
+    """
+    Turn each OCR'd page's geometry into structured Markdown.
+
+    Written to ``ocr_markdown`` rather than over ``ocr_text``, which stays as the
+    flat one-line-per-line output. The classification heuristics downstream —
+    ocr_looks_like_prose() above all — are tuned on that shape, and reflowing
+    first would make every page look like prose and silently disable escalation
+    to the vision model.
+
+    Returns the number of running header/footer lines removed.
+    """
+    stripped = strip_running_furniture(images)
+    for img in images:
+        if not img.layout_lines:
+            continue
+        body = reflow_layout(img.layout_lines)
+        if body and img.page_number:
+            body = f"<!-- page {img.page_number} -->\n\n{body}"
+        img.ocr_markdown = body
+    return stripped
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────
@@ -1189,6 +1797,11 @@ def build_image_reference(img_info: ImageInfo, images_dir_name: str) -> str:
         # blockquoting it would mark an entire scanned book as a quotation.
         if img_info.vision_description:
             return img_info.vision_description
+        if img_info.ocr_markdown:
+            return img_info.ocr_markdown
+        # No geometry to rebuild from. One line per line is all that is left, and
+        # Markdown will run them together — worse than the reflowed version, but
+        # this is the Tesseract path, where the coordinates were never available.
         return "\n".join(
             line.strip() for line in img_info.ocr_text.splitlines() if line.strip()
         )
@@ -1581,7 +2194,7 @@ def _pdf_via_inspector(input_path: Path, report: ProcessingReport) -> DocumentSo
         PdfPageInfo(
             number=page.page,
             markdown=merge_links_into_page(
-                normalize_pdf_tables(page.markdown or ""),
+                dehyphenate(normalize_pdf_tables(page.markdown or "")),
                 links.get(page.page, []),
             ),
             needs_ocr=bool(page.needs_ocr),
@@ -1595,6 +2208,10 @@ def _pdf_via_inspector(input_path: Path, report: ProcessingReport) -> DocumentSo
         logger.info(f"  Tables detected on page(s): {result.pages_with_tables}")
     if getattr(result, "pages_with_columns", None):
         logger.info(f"  Multi-column layout on page(s): {result.pages_with_columns}")
+
+    stripped = strip_text_layer_furniture(pages)
+    if stripped:
+        logger.info(f"  {stripped} running header/footer line(s) removed")
 
     found_links = sum(len(v) for v in links.values())
     if found_links:
@@ -1931,6 +2548,18 @@ def convert_document(
                     f"  {img.path.name}: OCR fragmented "
                     f"(edge={img.edge_density:.4f}) → routing to vision"
                 )
+
+    # Rebuild paragraphs, headings and lists from the OCR line geometry, and drop
+    # running headers and footers. Deliberately after escalation: that decision
+    # reads the flat one-line-per-line text, and reflowing first would make every
+    # page look like prose and stop any diagram ever reaching the vision model.
+    laid_out = [img for img in images if img.layout_lines]
+    if laid_out:
+        stripped = apply_layout(laid_out)
+        logger.info(
+            f"  Layout rebuilt for {len(laid_out)} page(s)"
+            + (f"; {stripped} running header/footer line(s) removed" if stripped else "")
+        )
 
     # ── Step 5: Vision analysis for semantic images ──────────────────────
     semantic_images = [img for img in images if img.classification == "semantic"]
