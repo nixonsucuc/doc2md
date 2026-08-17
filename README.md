@@ -322,11 +322,13 @@ Good places to start, roughly in order of how much someone would thank you:
 - **Swap a stage.** The table above lists candidates. Replacing PyMuPDF with
   pypdfium2 would be a self-contained change behind an existing seam, and would
   settle the AGPL question.
-- **Heading structure for scanned pages.** These come out of OCR flat. Note that
-  font-size inference has been tried and rejected — see MIGRATION.md §11 for the
-  measurements, including why bounding-box height and width-per-character both
-  fail. Per-character cap height via Vision is the untried approach that would
-  work.
+- **Title-case headings on scanned pages.** All-caps and larger-type headings are
+  recovered from line geometry; a heading that is neither — `Attitudes of the
+  Head` — is indistinguishable from a short body line and stays flat. See
+  MIGRATION.md §11 for why the obvious fix does not work: font-size inference was
+  tried and rejected, both via bounding-box height and via width-per-character.
+  Per-character cap height via Vision is the untried approach that would settle
+  it.
 - **Classifier calibration.** The thresholds come from a small corpus of mostly
   English and Spanish documents. Handwriting, dense scientific figures and
   non-Latin scripts are unexplored. Measurements beat opinions here — see

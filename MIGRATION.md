@@ -350,10 +350,15 @@ standalone images and small embedded images.
 - Removed a duplicated empty-images-directory cleanup and a `report_path` that
   was computed during path resolution and then immediately recomputed.
 
-## 11. Heading inference for OCR'd pages — investigated, rejected
+## 11. Heading inference for OCR'd pages — font size rejected, structure shipped
 
 Font-size heading inference kept coming up as an obvious win. It is not, and
 this records why so nobody repeats the experiment.
+
+Headings on scanned pages *are* now recovered, but not by measuring type size.
+The two size proxies below both failed and are still rejected; what worked was
+giving up on size and reading structure instead. That is §11.4 — read the
+failures first, because they are why the shipped rule looks the way it does.
 
 **It is already done where it can be done.** pdf-inspector infers H1–H4 from font
 size ratios, and does it well. Given a synthetic page with 28/20/15/12 pt text
@@ -406,7 +411,7 @@ headings in the source. Any fixed band splits them into `##` and `###`, which
 tells a reader the second is subordinate to the first. Inconsistent structure
 misleads more than no structure does; flat text at least makes no false claims.
 
-### What would change the verdict
+### What would still change the verdict on size
 
 Per-character geometry rather than per-line averages — Vision can return a
 bounding box for a character range, so cap height could be measured directly
@@ -414,5 +419,41 @@ instead of inferred from average advance width. That is immune to both faults:
 it does not care about descenders, and it does not care how many characters a
 line has. It costs an extra request per line, which is why it was not tried here.
 
-Until then, scanned pages stay flat. The document title from
-`detect_pdf()` still gives them an H1, which is most of the practical benefit.
+Still untried, and still the only route to a *reliable* type-size signal.
+
+### 11.4 What shipped instead: structure, not size
+
+The failures above share a premise — that a heading is recognised by being
+bigger. Drop it, and the problem becomes easy, because a heading is recognised
+by *standing alone*. `reflow_layout()` promotes a line only when all of these
+hold:
+
+| Test | Why |
+|---|---|
+| Isolated above and below | A heading sits in its own whitespace; a short body line does not |
+| Narrower than the text measure | Full-measure lines are prose, whatever their size |
+| At most 8 words | Beyond that it is a sentence |
+| No trailing `,;:.!?-` | Punctuation means it continues; this alone killed `## like saying "yes."` |
+| All-caps **or** ≥1.3× median height | The two shapes a heading actually takes |
+
+Size appears only in the last row, as one of two alternatives, and never
+promotes a line on its own. The all-caps branch matters more: in scanned books
+that is the common heading style, and it is the case pure size inference gets
+*backwards* — an all-caps line has no descenders, so it measures **shorter**
+than the body text around it.
+
+The 1.3 threshold comes from the same failure mode §11.1 documents. Measured
+across one page of body text, box height ranged 0.89–1.22× the median purely by
+which letters fell on each line, while the real heading `HEAD` measured 1.10×.
+1.3 clears that observed noise ceiling; anything lower fires on prose.
+
+Verified on the corpus: `## HEAD` and `## SHOULDERS` recovered from a page where
+both had previously been swallowed into a paragraph, with no false positives on
+the same page. A first version without the punctuation and width gates emitted
+`## like saying "yes."` and `## Up-Down` while still missing both real headings —
+which is the measurement that produced the table above.
+
+**Known miss:** title-case headings that are neither all-caps nor larger, such as
+`Attitudes of the Head`. Nothing distinguishes them from a short body line
+without the per-character cap height above. Left flat deliberately — a missing
+heading costs less than a wrong one.
