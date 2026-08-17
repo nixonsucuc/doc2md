@@ -23,3 +23,9 @@ usage.json
 
 # Claude Code per-machine local settings
 .claude/settings.local.json
+
+# Local test corpus. Useful scans to develop the layout and OCR work against,
+# but they are pages of published books — this repository is public, so they
+# stay on the machine that produced them. Keep your own here; nothing in the
+# tests depends on it, and the fixtures they do use are generated in-process.
+Sample Docs/
